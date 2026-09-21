@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- PyInstaller 构建产物（约 274MB，不进仓库）----
+build/
+dist/
+*.manifest
+
+# ---- 运行期数据（本地数据，绝不提交）----
+*.db
+*.db-shm
+*.db-wal
+ui_settings.json
+memo.log
+chime.wav
+backup/
+smoke_report.txt
+tools/_*.txt
+tools/_*.log
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+
+# 注意：preview/ 里的界面截图是故意提交的（README 用来展示效果），
+#      里面只有示例数据，没有真实个人信息。

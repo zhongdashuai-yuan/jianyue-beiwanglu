@@ -1,0 +1,12 @@
+# 备忘录提醒 - 依赖清单
+# 安装命令（在 PyCharm 的 Terminal 里执行）：
+#   python -m pip install -r requirements.txt
+#
+# ★ 版本必须钉在 6.8.x，不要升到 6.9 以上！
+#   原因：PyInstaller 打包后，6.9+ / 6.10+ / 6.11.x 的 Qt6Core.dll
+#   在冻结进程里会报 "DLL load failed while importing QtCore: 找不到指定的程序"
+#   （WinError 127），6.8.0.2 实测打包后可以正常运行。
+#   Python 3.13 能装的最老版本就是 6.8.0.2。
+
+PySide6-Essentials==6.8.0.2    # Qt6 官方绑定：界面 + 系统托盘 + 原生通知
+pyinstaller>=6.0               # 打包 exe（运行期不需要，只在打包时用）
