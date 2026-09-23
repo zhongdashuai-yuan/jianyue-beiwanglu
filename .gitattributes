@@ -1,0 +1,17 @@
+# 统一行尾符，避免"实际只改了几行、diff 却显示整个文件被重写"的噪音。
+# 背景：Windows 上的编辑器/脚本可能把文件写成 CRLF，而仓库里存的是 LF，
+# 于是每次提交都会出现几千行无意义的行尾差异。
+* text=auto eol=lf
+
+# 明确按二进制处理，别做任何行尾转换
+*.png binary
+*.ico binary
+*.wav binary
+*.jpg binary
+*.mp4 binary
+*.7z binary
+*.zip binary
+
+# Windows 批处理需要 CRLF，否则某些情况下会执行异常
+*.bat text eol=crlf
+*.cmd text eol=crlf

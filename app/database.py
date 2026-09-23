@@ -139,6 +139,14 @@ class Database:
         for col, ddl in wanted.items():
             if col not in have:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+
+        # 注意：这里**不要**去"修" done 与 done_date 的不一致。
+        #   done=1 表示"本轮做完了"，done_date 表示"哪天做完的" ——
+        #   两者本来就允许分开：完成日期是过去某天时，说明新的一天到了，
+        #   调度器应当把它当成可以再提醒的任务（见 active_tasks 的判定）。
+        #   曾经误改成"有 done_date 就强制 done=1"，结果 active_tasks() 的
+        #   查询条件 done=0 永远不成立，所有任务都不再被提醒。
+        self.conn.commit()
         self.conn.commit()
 
     def _seed_defaults(self) -> None:
@@ -206,14 +214,28 @@ class Database:
         return [Task.from_row(r) for r in self.conn.execute(sql)]
 
     def active_tasks(self) -> list[Task]:
-        """还没完成、且启用了的任务（调度器主查询）。"""
+        """还没完成、且启用了的任务（调度器主查询）。
+
+        判定要覆盖"新的一天到了"的情况：
+          * done=0                              -> 没做完，该提醒
+          * done=1 但完成日期是过去某天          -> 那是上一轮做完的，
+                                                   新的一天应当恢复提醒
+        只用 done=0 会导致：重复任务完成后（done=1）第二天永远回不来，
+        这正是用户报过的"第二天就不再提醒"的问题根因。
+        """
+        today = date.today().isoformat()
         return [Task.from_row(r) for r in self.conn.execute(
-            "SELECT * FROM tasks WHERE done=0 AND enabled=1 ORDER BY next_at ASC, id ASC")]
+            "SELECT * FROM tasks WHERE enabled=1 AND (done=0 OR "
+            "(done=1 AND done_date IS NOT NULL AND done_date < ?)) "
+            "ORDER BY next_at ASC, id ASC", (today,))]
 
     def tasks_with_next_at(self) -> list[Task]:
+        """有下次提醒时间、且调度器该考虑的任务（和 active_tasks 同一套判定）。"""
+        today = date.today().isoformat()
         return [Task.from_row(r) for r in self.conn.execute(
-            "SELECT * FROM tasks WHERE done=0 AND enabled=1 AND next_at IS NOT NULL "
-            "ORDER BY next_at ASC")]
+            "SELECT * FROM tasks WHERE enabled=1 AND next_at IS NOT NULL "
+            "AND (done=0 OR (done=1 AND done_date IS NOT NULL AND done_date < ?)) "
+            "ORDER BY next_at ASC", (today,))]
 
     # ------------------------------------------------------- 完成 / 撤销完成
     def mark_done(self, task: Task, day: date | None = None,

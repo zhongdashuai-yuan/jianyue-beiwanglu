@@ -183,6 +183,16 @@ SNOOZE_CHOICES = [5, 10, 30]     # 稍后提醒档位（分钟）
 # 提醒过了多久还没确认就算"错过"（用于第二天启动时的补提醒）
 MISSED_GRACE_MINUTES = 10
 
+# 刚开机/重启时，错过超过这个时长的提醒不再弹窗（避免开机被积压的过期提醒刷屏），
+# 只在界面里显示为「未完成」。
+#
+# 取 1 小时的理由：这个阈值要同时满足两边 ——
+#   * 关机一晚（十几小时）→ 远大于 1 小时，静默，不刷屏 ✓
+#   * 程序崩溃重开、临时关机十几分钟 → 小于 1 小时，仍然补提醒 ✓（不然刚错过的就没了）
+# 注意：这条只作用于"启动后的第一次扫描"；电脑一直开着时到点照常弹，
+# 休眠几分钟后唤醒也照常补提醒。
+STARTUP_SILENT_MINUTES = 60
+
 # 节假日躲开的默认策略
 # 注意：这个上限必须大于「最长的连续假期」。
 # 2025/2026 的国庆+中秋连休是 8 天，春节连休是 9 天，
@@ -225,6 +235,33 @@ AUTOSTART_ARGS = "--autostart"               # 开机静默启动参数
 # ----------------------------------------------------------------------------
 # 五、读写用户设置
 # ----------------------------------------------------------------------------
+
+def log_problem(where: str, exc: BaseException | None = None,
+                detail: str = "") -> None:
+    """记录一处"被吞掉但值得知道"的问题，追加到 memo.log。
+
+    为什么需要它：程序里有些地方出错后要继续运行（比如某个界面回调失败，
+    不该让整个主题切换跟着崩），以前是 `except Exception: pass` —— 结果
+    一旦功能悄悄失效，用户只会觉得"这功能没反应"，日志里也什么都查不到。
+    现在统一往 memo.log 里留一条记录，方便排查。
+
+    这个函数自己绝不抛异常（日志写不进去也不能影响主流程）。
+    """
+    try:
+        import traceback
+        from datetime import datetime
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        lines = [f"===== {datetime.now():%Y-%m-%d %H:%M:%S} [非致命] {where} ====="]
+        if detail:
+            lines.append(detail)
+        if exc is not None:
+            lines.append("".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)))
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
 
 class Settings:
     """简单的 JSON 键值设置。改了就存盘，程序里到处都用 settings.get(...)。"""

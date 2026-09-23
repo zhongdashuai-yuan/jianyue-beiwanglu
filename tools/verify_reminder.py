@@ -131,12 +131,11 @@ def main() -> int:
     a_kinds = {f["kind"] for f in fires if f["task_id"] == a_id}
     b_kinds = {f["kind"] for f in fires if f["task_id"] == b_id}
     a_count = len([f for f in fires if f["task_id"] == a_id])
+    b_fired = any(k in ("popup", "catchup") for k in b_kinds)
 
-    check("任务 A 触发了提醒（fire_log 有记录）", bool(a_kinds), f"kind={a_kinds}")
+    check("任务 A 触发了提醒（准点路径）", bool(a_kinds), f"kind={a_kinds}")
     check("任务 A 只提醒了一次（没有重复弹窗刷屏）", a_count == 1,
           f"共 {a_count} 次")
-    check("任务 B 触发了补提醒（catchup）", "catchup" in b_kinds or bool(b_kinds),
-          f"kind={b_kinds}")
     check("任务 A 的 last_fired_at 已写入", bool(ta and ta.last_fired_at),
           str(ta.last_fired_at if ta else None))
     check("任务 A 的 next_at 已推到下一次（不会一直卡在过期）",
@@ -145,8 +144,21 @@ def main() -> int:
     check("任务 A 的下次时间在未来",
           bool(ta and ta.next_at and ta.next_at > now.strftime("%Y-%m-%d %H:%M")),
           str(ta.next_at if ta else None))
-    check("任务 B 仍是未完成状态（弹了但没点完成，应该继续提醒）",
-          bool(tb and not tb.done))
+
+    # 任务 B 是"今天 07:30 错过、现在已过去很久"的情况。
+    # 按设计（cfg.STARTUP_SILENT_MINUTES=60 分钟）它属于"启动时静默"的过期提醒：
+    # 不该弹窗刷屏，但要留下 advance 记录说明为什么没提醒，也不能被标成已完成。
+    if b_fired:
+        check("任务 B 触发了补提醒（错过在静默阈值内）", True, f"kind={b_kinds}")
+    else:
+        check("任务 B 按设计静默跳过（过期超过阈值，不弹窗）",
+              "advance" in b_kinds,
+              f"kind={b_kinds}（应为 advance：已跳过并重排）")
+    check("任务 B 仍是未完成状态（界面上要显示它还没做）",
+          bool(tb and not tb.done), f"done={tb.done if tb else None}")
+    check("任务 B 的下次提醒已排到未来（不会一直卡在过去）",
+          bool(tb and tb.next_at and tb.next_at > now.strftime("%Y-%m-%d %H:%M")),
+          str(tb.next_at if tb else None))
 
     # 收尾
     if proc.poll() is None:

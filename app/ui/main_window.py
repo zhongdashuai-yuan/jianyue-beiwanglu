@@ -144,6 +144,9 @@ class Sidebar(QFrame):
             item = self.tag_box.takeAt(0)
             w = item.widget()
             if w:
+                # 先隐藏再断开父关系：setParent(None) 会把控件变成顶层窗口，
+                # 若它当时可见，就会在销毁前以独立小窗口闪一下（用户报过这个现象）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
         allb = chip("全部标签", not self._tags)
@@ -155,15 +158,22 @@ class Sidebar(QFrame):
             self.tag_box.insertWidget(self.tag_box.count() - 1, b)
 
     def _toggle_tag(self, name: str):
-        if name == "__all__":
-            self._tags = []
-        elif name in self._tags:
-            self._tags.remove(name)
-        else:
-            self._tags.append(name)
-        self.settings.set("tag_filter", self._tags)
-        self.refresh_tags()
-        self.tag_filter_changed.emit(list(self._tags))
+        # 整个处理过程包一层：万一出错要写进日志（含完整堆栈），
+        # 否则只会弹一个错误框、日志里什么都查不到，很难定位。
+        try:
+            if name == "__all__":
+                self._tags = []
+            elif name in self._tags:
+                self._tags.remove(name)
+            else:
+                self._tags.append(name)
+            self.settings.set("tag_filter", self._tags)
+            self.refresh_tags()
+            self.tag_filter_changed.emit(list(self._tags))
+        except Exception as e:
+            cfg.log_problem("切换标签筛选失败", e,
+                            f"标签={name!r} 当前筛选={self._tags!r}")
+            raise
 
     def refresh_overview(self):
         st = stats_mod.day_stats(self.db, date.today())
@@ -279,6 +289,9 @@ class MainWindow(QWidget):
             self.stack.addWidget(v)
         content.addWidget(self.stack, 1)
 
+        # 列表页的「清除筛选」按钮要同步回侧边栏的标签选中状态
+        self.list_view.on_filter_cleared = self._on_filter_cleared_from_list
+
         # 视图信号
         for view in (self.list_view, self.calendar_view):
             view.task_edit.connect(self.edit_task)
@@ -336,6 +349,13 @@ class MainWindow(QWidget):
 
     def _on_day_selected(self, d):
         self.lbl_sub.setText(f"（{d.month}月{d.day}日）")
+
+    def _on_filter_cleared_from_list(self):
+        """列表页点了「清除筛选」：清掉侧边栏的标签选中态并保存。"""
+        self.sidebar._tags = []
+        self.settings.set("tag_filter", [])
+        self.sidebar.refresh_tags()
+        self.refresh_all()
 
     # ------------------------------------------------------------------ 刷新
     def refresh_all(self):
@@ -430,11 +450,12 @@ class MainWindow(QWidget):
                 planned = date.today()
             self.scheduler.complete(t, planned=planned)
         else:
-            self.db.unmark_done(t)
-            fresh = self.db.get_task(task_id)
-            if fresh:
-                self.db.update_fields(task_id, enabled=1,
-                                      next_at=compute_next_at(fresh))
+            # ★ 取消完成交给调度器统一处理：清完成记录、把"下次提醒"放回今天、
+            #   并保证不因此补弹（细节见 ReminderScheduler.unmark_done_reschedule）。
+            #   以前这里用 compute_next_at() 重排，它会把"今天已经过去的时间点"
+            #   算回来，任务立刻变成"已过期"，调度器马上补弹一次 ——
+            #   用户看到的就是"取消勾选后弹窗又冒出来"。
+            self.scheduler.unmark_done_reschedule(t)
         self.refresh_all()
 
     def _on_snooze(self, task_id: int):

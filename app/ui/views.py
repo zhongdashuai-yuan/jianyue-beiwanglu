@@ -50,10 +50,15 @@ class ListView(QWidget):
         # --- 过滤栏 ---
         bar = QHBoxLayout()
         bar.setSpacing(8)
+        # 注意：筛选值存在按钮属性上，不要用按钮文字去查表 ——
+        # "全部" 按钮的文字后面会被改成 "全部 12"（带数量），
+        # 之前用 sender.text() 查表就是在这里炸出 KeyError 的。
         self.btn_all = chip("全部", True)
         self.btn_todo = chip("未完成", False)
         self.btn_done = chip("已完成", False)
-        for b in (self.btn_all, self.btn_todo, self.btn_done):
+        for b, key in ((self.btn_all, "all"), (self.btn_todo, "todo"),
+                       (self.btn_done, "done")):
+            b.setProperty("filter_key", key)
             b.clicked.connect(self._on_filter_clicked)
             bar.addWidget(b)
         bar.addStretch(1)
@@ -61,6 +66,27 @@ class ListView(QWidget):
         self.lbl_count.setObjectName("Muted")
         bar.addWidget(self.lbl_count)
         root.addLayout(bar)
+
+        # --- 标签筛选提示条 ---
+        # 为什么要有这个：标签筛选以前是"静默生效"的，用户点过几个标签后
+        # 下次打开发现任务少了好几条，会以为数据丢了。这里显式告诉用户
+        # "现在按哪些标签在筛"，并给一个一键清除。
+        self.filter_hint = QFrame()
+        self.filter_hint.setObjectName("Panel")
+        fh = QHBoxLayout(self.filter_hint)
+        fh.setContentsMargins(10, 6, 8, 6)
+        fh.setSpacing(8)
+        self.lbl_filter_hint = QLabel("")
+        self.lbl_filter_hint.setObjectName("Sub")
+        fh.addWidget(self.lbl_filter_hint)
+        fh.addStretch(1)
+        btn_clear = QPushButton("清除筛选")
+        btn_clear.setObjectName("Ghost")
+        btn_clear.setCursor(Qt.PointingHandCursor)
+        btn_clear.clicked.connect(self._clear_tag_filter)
+        fh.addWidget(btn_clear)
+        self.filter_hint.setVisible(False)
+        root.addWidget(self.filter_hint)
 
         # --- 滚动区 ---
         self.scroll = QScrollArea()
@@ -86,25 +112,51 @@ class ListView(QWidget):
         self.tag_filter = list(tags or [])
         self.refresh()
 
+    def _clear_tag_filter(self):
+        """一键清空标签筛选，并通知 MainWindow 同步侧边栏的选中状态。"""
+        self.tag_filter = []
+        self.refresh()
+        cb = getattr(self, "on_filter_cleared", None)
+        if callable(cb):
+            cb()
+
     def _on_filter_clicked(self):
         sender = self.sender()
         for b in (self.btn_all, self.btn_todo, self.btn_done):
             b.setChecked(b is sender)
-        self._filter = {"全部": "all", "未完成": "todo", "已完成": "done"}[sender.text()]
+        # 从按钮属性读筛选值（按钮文字会带数量，不能拿来当 key）
+        self._filter = sender.property("filter_key") or "all"
         self.refresh()
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def _is_done_today(self, t) -> bool:
+        """这条任务今天算不算「已完成」。
+
+        直接复用任务卡片用的同一个判定（widgets.is_done_for），
+        保证「分组」「筛选」「卡片上的勾」三处结论一致。
+        之前这里单独写了一套，结果出现过"分组说未完成、卡片却画着勾"。
+        """
+        from .widgets import is_done_for
+        return is_done_for(t)
+
     def _matches(self, t) -> bool:
         if self.search_text:
             hay = f"{t.title} {t.note} {t.category} {' '.join(t.tags)}".lower()
             if self.search_text not in hay:
                 return False
         if self.tag_filter:
-            if not set(self.tag_filter) & set(t.tags or []):
+            # 标签比较要忽略大小写和首尾空格，否则用户手输标签时
+            # 大小写不一致就会被"静默过滤掉"，看起来像任务丢了。
+            want = {str(x).strip().lower() for x in self.tag_filter if str(x).strip()}
+            have = {str(x).strip().lower() for x in (t.tags or [])}
+            if not (want & have):
                 return False
-        if self._filter == "todo" and t.done:
+        # 完成状态用统一判定，和分组保持一致
+        is_done = self._is_done_today(t)
+        if self._filter == "todo" and is_done:
             return False
-        if self._filter == "done" and not t.done:
+        if self._filter == "done" and not is_done:
             return False
         return True
 
@@ -115,6 +167,9 @@ class ListView(QWidget):
             item = self.vbox.takeAt(0)
             w = item.widget()
             if w:
+                # 先隐藏再断开父关系：setParent(None) 会把控件变成顶层窗口，
+                # 若它当时可见，就会在销毁前以独立小窗口闪一下（用户报过这个现象）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
@@ -135,9 +190,14 @@ class ListView(QWidget):
                 continue
             items.sort(key=lambda x: (x.next_at or "9999", -cfg.PRIORITIES.index(x.priority)
                                       if x.priority in cfg.PRIORITIES else 0))
-            self.vbox.insertWidget(self.vbox.count() - 1, self._group_header(key, len(items), c))
+            self.vbox.insertWidget(self.vbox.count() - 1,
+                                   self._group_header(key, len(items), c))
             for t in items:
-                card = TaskCard(t, self.theme)
+                # ★ 必须把父控件传进去（parent=self.holder）。
+                #   不传的话 TaskCard 会先被当成"顶层窗口"，在它被放进布局之前
+                #   Qt 会把它当独立小窗口显示一帧 —— 表现就是点筛选/标签时
+                #   屏幕上一闪而过一个空白小框（用户报过这个现象）。
+                card = TaskCard(t, self.theme, parent=self.holder)
                 card.toggled.connect(self.task_toggled)
                 card.edit_requested.connect(self.task_edit)
                 card.snooze_requested.connect(self.task_snooze)
@@ -147,21 +207,39 @@ class ListView(QWidget):
                 total_shown += 1
 
         if total_shown == 0:
+            # 注意：所有新建的控件都要显式传 parent（这里是 self.holder）。
+            # Qt 里没有父对象的 QWidget 会先被当成"顶层窗口"，在被放进布局之前
+            # 可能在屏幕上闪一下。把所有创建点都带上 parent，从根上避免这种闪烁。
             if self.search_text:
                 self.vbox.insertWidget(0, EmptyState("🔍", "没找到匹配的提醒",
-                                                     "换个关键词试试"))
+                                                     "换个关键词试试",
+                                                     parent=self.holder))
             elif self._filter == "done":
                 self.vbox.insertWidget(0, EmptyState("🌱", "还没有完成过的事情",
-                                                     "完成一件后这里会出现记录"))
+                                                     "完成一件后这里会出现记录",
+                                                     parent=self.holder))
             else:
                 self.vbox.insertWidget(0, EmptyState(
-                    "☕", "今天还没有安排", "点右上角「＋ 新建提醒」加一件要做的事"))
+                    "☕", "今天还没有安排", "点右上角「＋ 新建提醒」加一件要做的事",
+                    parent=self.holder))
 
+        # 只给「全部」按钮带数量，另外两个不带 —— 否则文字宽度频繁变化、按钮会一直抖。
+        # 注意：改的只是显示文字，筛选值在按钮的 filter_key 属性里，不受影响。
         self.btn_all.setText(f"全部 {len(self.db.all_tasks())}")
         self.lbl_count.setText(f"当前显示 {total_shown} 条")
 
+        # 标签筛选提示条：有筛选时才出现，写明在按哪些标签筛
+        if self.tag_filter:
+            names = "、".join(str(x) for x in self.tag_filter)
+            self.lbl_filter_hint.setText(
+                f"已按标签筛选：{names}　（没有这些标签的任务不会显示）")
+            self.filter_hint.setVisible(True)
+        else:
+            self.filter_hint.setVisible(False)
+
     def _group_of(self, t, today: date) -> str:
-        if t.done:
+        # 完成状态用统一判定（_is_done_today），保证和"已完成"筛选结论一致
+        if self._is_done_today(t):
             return "已完成"
         if not t.enabled:
             return "已停用"
@@ -364,6 +442,9 @@ class CalendarView(QWidget):
             item = self.grid.takeAt(0)
             w = item.widget()
             if w:
+                # 先隐藏再断开父关系：setParent(None) 会把控件变成顶层窗口，
+                # 若它当时可见，就会在销毁前以独立小窗口闪一下（用户报过这个现象）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
@@ -584,15 +665,21 @@ class CalendarView(QWidget):
             item = self.day_vbox.takeAt(0)
             w = item.widget()
             if w:
+                # 先隐藏再断开父关系：setParent(None) 会把控件变成顶层窗口，
+                # 若它当时可见，就会在销毁前以独立小窗口闪一下（用户报过这个现象）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
         if not tasks:
-            self.day_vbox.insertWidget(0, EmptyState("🍃", "这天没有安排", "可以点「＋ 新建提醒」加一件"))
+            self.day_vbox.insertWidget(0, EmptyState(
+                "🍃", "这天没有安排", "可以点「＋ 新建提醒」加一件",
+                parent=self.day_holder))
             return
         tasks.sort(key=lambda t: (t.next_at or "", t.id or 0))
         for t in tasks:
-            card = TaskCard(t, self.theme, compact=True)
+            # 同样要传父控件，否则日历右侧的卡片也会"一闪而过"（见列表视图里的说明）
+            card = TaskCard(t, self.theme, compact=True, parent=self.day_holder)
             card.edit_requested.connect(self.task_edit)
             card.toggled.connect(self.task_toggled)
             card.btn_snooze.setVisible(False)
@@ -605,6 +692,33 @@ class CalendarView(QWidget):
 # 统计视图
 # ===========================================================================
 
+def bar_geometry(w: float, h: float, n: int) -> dict:
+    """柱状图的几何计算（抽出来单独成函数，方便测试）。
+
+    返回每根柱子的 x 坐标、宽度、可用最大高度和基线 y。
+
+    ★ 圆角半径的坑：Qt 会把半径限制到 min(宽,高)/2。之前底槽和填充
+    写死同一个半径，底槽高时内缩多、矮填充内缩少，结果矮柱子比底槽宽，
+    看着像"填充溢出到圈外"。现在没有底槽了，半径统一用 bar_radius()
+    按各自矩形算，就不会再有这个问题。
+    """
+    pad_l, pad_b, pad_t = 8, 30, 20
+    gap = 12
+    bw = max(10.0, (w - pad_l * 2 - gap * (n - 1)) / n) if n else 10.0
+    base_y = h - pad_b
+    max_h = h - pad_b - pad_t
+    slots = [pad_l + i * (bw + gap) for i in range(n)]
+    return {
+        "pad_l": pad_l, "pad_t": pad_t, "pad_b": pad_b, "gap": gap,
+        "bw": bw, "base_y": base_y, "max_h": max_h, "slots": slots,
+    }
+
+
+def bar_radius(bw: float, height: float) -> float:
+    """矩形该用的圆角半径 —— 上限是自己短边的一半，画出来就是药丸形。"""
+    return min(bw, height) / 2
+
+
 class MiniBarChart(QWidget):
     """一周完成率柱状图（自绘，没有第三方图表库）。"""
 
@@ -612,7 +726,13 @@ class MiniBarChart(QWidget):
         super().__init__(parent)
         self.theme = theme
         self.data: list[dict] = []
-        self.setMinimumHeight(150)
+        # 去掉底槽以后不需要那么在高度上留白了：固定 132px，
+        # 柱子会有合适的长度，上方也不会出现大片空白。
+        self.setFixedHeight(132)
+        # 记录上一次绘制实际用到的几何（矩形 + 圆角半径）。
+        # 不是给界面用的，是给测试用的 —— 测试直接读它验证
+        # "填充不会比底槽宽"，比去猜像素可靠得多。
+        self.last_drawn: list[dict] = []
 
     def set_data(self, daily: list[dict]):
         self.data = daily or []
@@ -623,35 +743,53 @@ class MiniBarChart(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
+        self.last_drawn = []
         if not self.data:
             p.setPen(QColor(c["text_mute"]))
             p.drawText(self.rect(), Qt.AlignCenter, "暂无数据")
             p.end()
             return
 
-        pad_l, pad_b, pad_t = 8, 26, 18
-        n = len(self.data)
-        gap = 12
-        bw = max(10.0, (w - pad_l * 2 - gap * (n - 1)) / n)
-        base_y = h - pad_b
-        max_h = h - pad_b - pad_t
+        geo = bar_geometry(w, h, len(self.data))
+        bw = geo["bw"]
+        max_h = geo["max_h"]
+        base_y = geo["base_y"]
+
+        # 说明：底槽（原来那一排大圆圈）已按用户要求去掉，只保留填充柱。
+        # 代价是"完成率为 0 的那天"高度为 0、什么都看不到 ——
+        # 所以给它留一个很矮的小圆点做占位，让人知道这天存在且是 0。
+        stub_h = max(6.0, bw * 0.09)
 
         for i, d in enumerate(self.data):
-            x = pad_l + i * (bw + gap)
-            # 底槽
+            x = geo["slots"][i]
             p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(c["today_ring_bg"])))
-            p.drawRoundedRect(QRectF(x, pad_t, bw, max_h), bw / 2, bw / 2)
-
-            # 柱子
             ratio = max(0.0, min(1.0, d.get("rate", 0.0)))
             bh = max_h * ratio if d.get("total") else 0
-            if bh > 2:
+            fill_rect = None
+            fill_r = 0.0
+
+            if bh < 2:
+                # 0%（或没有任务）：画一个小圆点占位，比例仍然是 0
+                if d.get("total"):
+                    p.setBrush(QBrush(QColor(c["today_ring_bg"])))
+                    p.drawRoundedRect(QRectF(x, base_y - stub_h, bw, stub_h),
+                                      stub_h / 2, stub_h / 2)
+            else:
+                r = bar_radius(bw, bh)
+                fill_rect = QRectF(x, base_y - bh, bw, bh)
+                fill_r = r
                 g = QLinearGradient(0, base_y - bh, 0, base_y)
                 g.setColorAt(0, QColor(c["accent2"]))
                 g.setColorAt(1, QColor(c["accent"]))
                 p.setBrush(QBrush(g))
-                p.drawRoundedRect(QRectF(x, base_y - bh, bw, bh), bw / 2, bw / 2)
+                p.drawRoundedRect(fill_rect, r, r)
+
+            self.last_drawn.append({
+                "x": x, "bw": bw, "max_h": max_h, "base_y": base_y,
+                "fill": (fill_rect.x(), fill_rect.y(), fill_rect.width(),
+                         fill_rect.height()) if fill_rect else None,
+                "fill_r": fill_r, "ratio": ratio, "stub_h": stub_h,
+            })
 
             # 完成情况：显示 "完成数/应做数"，比只显示完成数更好理解
             if d.get("total"):
@@ -930,6 +1068,9 @@ class StatsView(QWidget):
             item = self.week_bars.takeAt(0)
             w = item.widget()
             if w:
+                # 先隐藏再断开父关系：setParent(None) 会把控件变成顶层窗口，
+                # 若它当时可见，就会在销毁前以独立小窗口闪一下（用户报过这个现象）。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
         for row in stats_mod.weekday_completion(self.db, weeks=max(4, self.period_days // 7)):

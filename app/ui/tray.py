@@ -90,7 +90,9 @@ class Tray(QSystemTrayIcon):
             tip = f"{cfg.APP_NAME}\n今天 {st['done']}/{st['total']} 已完成"
             if st["left"]:
                 tip += f"，还剩 {st['left']} 件"
-        except Exception:
+        except Exception as e:
+            # 只是托盘的悬浮提示，失败不影响提醒功能，但留个记录方便排查
+            cfg.log_problem("托盘提示更新失败", e)
             tip = cfg.APP_NAME
         if self._paused:
             tip += "\n（提醒已暂停）"

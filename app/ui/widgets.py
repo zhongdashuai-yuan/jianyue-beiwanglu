@@ -263,6 +263,29 @@ class RingProgress(QWidget):
 # 任务卡片
 # ---------------------------------------------------------------------------
 
+def is_done_for(task, day=None) -> bool:
+    """这条任务在指定日期算不算「已完成」。
+
+    两个字段的分工：
+        done       = 这一轮做完了没有
+        done_date  = 哪一天做完的
+    所以"今天算不算完成"必须两个一起看：done=1 但完成日期是以前某天，
+    说明那是上一轮做完的，今天还没做 —— 例如每天的任务昨天打了勾，
+    今天重开程序时它应该是空的，不该还画着勾。
+
+    判定要统一用在三个地方，否则会出现"分组说未完成、卡片却画着勾"的矛盾：
+        ListView._is_done_today()（分组/筛选）
+        TaskCard（勾选框与完成时间）
+        日历与统计（各自按天判断）
+    """
+    if not task.done:
+        return False
+    d = (day or date.today()).isoformat()
+    if task.done_date and task.done_date < d:
+        return False        # 那是以前做完的，这一天还没做
+    return True
+
+
 class TaskCard(QFrame):
     toggled = Signal(int, bool)      # task_id, 是否完成
     edit_requested = Signal(int)
@@ -276,8 +299,12 @@ class TaskCard(QFrame):
         self.theme = theme
         self._hover = False
         self._compact = compact
+        # 关键：勾选框和"已完成"样式都要按"今天是否完成"来画，
+        # 不能直接用 task.done —— 那是"上一轮做完了"的意思，
+        # 对每天/每周的重复任务来说，昨天打勾不代表今天已完成。
+        done_today = is_done_for(task)
 
-        self.setObjectName("CardDone" if task.done else "Card")
+        self.setObjectName("CardDone" if done_today else "Card")
         self.setAttribute(Qt.WA_Hover, True)
         self.setCursor(Qt.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -292,7 +319,7 @@ class TaskCard(QFrame):
         self._bar_color_key = cfg.PRIORITY_COLOR_KEY.get(task.priority, "p_low")
 
         # 勾选框
-        self.check = AnimatedCheck(task.done)
+        self.check = AnimatedCheck(done_today)
         self.check.setFixedWidth(30)
         self.check.apply_theme(theme.c)
         self.check.toggled.connect(self._on_check)
@@ -313,7 +340,7 @@ class TaskCard(QFrame):
         line1.addWidget(self.lbl_time)
 
         self.lbl_title = QLabel(task.title or "(无标题)")
-        self.lbl_title.setObjectName("CardTitleDone" if task.done else "CardTitle")
+        self.lbl_title.setObjectName("CardTitleDone" if done_today else "CardTitle")
         self.lbl_title.setWordWrap(False)
         line1.addWidget(self.lbl_title, 1)
 
@@ -345,7 +372,9 @@ class TaskCard(QFrame):
         self.lbl_meta.setObjectName("Muted")
         line2.addWidget(self.lbl_meta)
 
-        if task.done and task.completed_at:
+        # 只有"今天完成"才显示完成时间。用 done_today 而不是 task.done ——
+        # 否则昨天打了勾的每日任务，今天会显示"✓ 昨天17:18 完成"，看起来像今天做完了。
+        if done_today and task.completed_at:
             self.lbl_done = QLabel(f"✓ {task.completed_at[11:16]} 完成")
             self.lbl_done.setStyleSheet(
                 f"color: {theme.c['p_low']}; font-size: 11px;")
@@ -397,15 +426,19 @@ class TaskCard(QFrame):
     def _on_check(self, checked: bool):
         self.toggled.emit(self.task.id, checked)
 
+    def _done_now(self) -> bool:
+        """当前是否显示为"今天已完成"（hover 效果和色条都按它判断）。"""
+        return is_done_for(self.task)
+
     def enterEvent(self, e):
         self._hover = True
-        if not self.task.done:
+        if not self._done_now():
             self.setObjectName("Card")
             self.setStyleSheet("")   # 触发 QSS 重算
             self.style().unpolish(self)
             self.style().polish(self)
         for b in (self.btn_snooze, self.btn_skip, self.btn_del):
-            if not self.task.done:
+            if not self._done_now():
                 b.setVisible(True)
         self._shadow.setBlurRadius(22)
         self._shadow.setOffset(0, 4)
@@ -439,8 +472,8 @@ class TaskCard(QFrame):
     # ---------------------------------------------------------------- 绘制
     def paintEvent(self, e):
         super().paintEvent(e)
-        # 左侧优先级色条：圆角矩形，贴在卡片左内侧
-        if self.task.done:
+        # 左侧优先级色条：圆角矩形，贴在卡片左内侧（今天已完成的卡片不画）
+        if self._done_now():
             return
         c = QColor(self.theme.c[self._bar_color_key])
         if not self._hover:

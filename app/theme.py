@@ -413,8 +413,11 @@ class ThemeManager:
         for cb in self._listeners:
             try:
                 cb(c)
-            except Exception:
-                pass
+            except Exception as e:
+                # 一个回调失败不该让整个换肤中断，但必须留下记录，
+                # 否则界面某块没跟着换色、用户只会觉得"怪怪的"却查不到原因。
+                cfg.log_problem("theme.apply 的回调", e,
+                                f"mode={self.mode} 回调={getattr(cb, '__qualname__', cb)}")
         return self.mode
 
     def on_change(self, callback) -> None:

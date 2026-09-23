@@ -367,12 +367,35 @@ class TaskEditDialog(QDialog):
         row.addLayout(cv, 1)
         bl.addLayout(row)
 
-        # 标签
+        # 标签：改成"点选胶囊"，不用手打逗号分隔（和左侧栏一样的操作方式）
         tv = QVBoxLayout()
-        tv.addWidget(QLabel("标签（逗号分隔）"))
-        self.edit_tags = QLineEdit("，".join(self.task.tags))
-        self.edit_tags.setPlaceholderText("例如：重要，紧急")
-        tv.addWidget(self.edit_tags)
+        tv.setSpacing(6)
+        tv.addWidget(QLabel("标签（点一下选中/取消）"))
+        self.tag_box = QWidget()
+        self.tag_flow = QHBoxLayout(self.tag_box)
+        self.tag_flow.setContentsMargins(0, 0, 0, 0)
+        self.tag_flow.setSpacing(6)
+        tv.addWidget(self.tag_box)
+
+        # 新增标签的入口：程序里可能只有寥寥几个标签，得能加新的
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        self.edit_new_tag = QLineEdit()
+        self.edit_new_tag.setPlaceholderText("新标签名，例如：毕设")
+        self.edit_new_tag.setMaximumWidth(180)
+        self.edit_new_tag.returnPressed.connect(self._add_new_tag)
+        add_row.addWidget(self.edit_new_tag)
+        btn_add_tag = QPushButton("＋ 添加标签")
+        btn_add_tag.setObjectName("Ghost")
+        btn_add_tag.setCursor(Qt.PointingHandCursor)
+        btn_add_tag.clicked.connect(self._add_new_tag)
+        add_row.addWidget(btn_add_tag)
+        add_row.addStretch(1)
+        tv.addLayout(add_row)
+
+        self._tag_buttons: dict[str, QPushButton] = {}
+        self._selected_tags: list[str] = list(self.task.tags or [])
+        self._rebuild_tag_chips()
         bl.addLayout(tv)
 
         bl.addWidget(self._divider(theme))
@@ -453,6 +476,65 @@ class TaskEditDialog(QDialog):
         self._update_preview()
 
     # ------------------------------------------------------------------ 小零件
+    def _all_tag_names(self) -> list[str]:
+        """所有可选标签 = 数据库里已存在的 + 这条任务已选的（去重，保持顺序）。"""
+        names: list[str] = []
+        try:
+            if self.db is not None:
+                names += [g.name for g in self.db.tags()]
+        except Exception:
+            pass
+        for n in self._selected_tags:
+            if n not in names:
+                names.append(n)
+        return names
+
+    def _rebuild_tag_chips(self):
+        """重建标签胶囊（点一下选中/取消）。"""
+        while self.tag_flow.count():
+            item = self.tag_flow.takeAt(0)
+            w = item.widget()
+            if w:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        self._tag_buttons.clear()
+        for name in self._all_tag_names():
+            b = QPushButton(name)
+            b.setObjectName("Chip")
+            b.setCheckable(True)
+            b.setChecked(name in self._selected_tags)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, n=name: self._toggle_tag_chip(n))
+            self.tag_flow.addWidget(b)
+        self.tag_flow.addStretch(1)
+
+    def _toggle_tag_chip(self, name: str):
+        if name in self._selected_tags:
+            self._selected_tags.remove(name)
+        else:
+            self._selected_tags.append(name)
+        for n, b in self._tag_buttons.items():
+            b.setChecked(n in self._selected_tags)
+
+    def _add_new_tag(self):
+        """把输入框里的名字加成新标签并直接选中。"""
+        name = self.edit_new_tag.text().strip()
+        if not name:
+            return
+        if name not in self._selected_tags:
+            self._selected_tags.append(name)
+        try:
+            if self.db is not None:
+                self.db.add_tag(name)
+        except Exception:
+            pass
+        self.edit_new_tag.clear()
+        self._rebuild_tag_chips()
+
+    def selected_tags(self) -> list[str]:
+        return list(self._selected_tags)
+
     def _section(self, text: str, theme) -> QLabel:
         lb = QLabel(text)
         lb.setStyleSheet(
@@ -525,8 +607,7 @@ class TaskEditDialog(QDialog):
         t.note = self.edit_note.toPlainText().strip()
         t.priority = self.cmb_prio.currentText()
         t.category = self.cmb_cat.currentText().strip() or "未分类"
-        t.tags = [x.strip() for x in self.edit_tags.text().replace("，", ",").split(",")
-                  if x.strip()]
+        t.tags = list(self._selected_tags)
         t.times = self._collect_times()
         t.lead_minutes = int(self.cmb_lead.currentData() or 0)
         t.enabled = self.chk_enabled.isChecked()

@@ -20,7 +20,7 @@ from . import config as cfg
 from .database import Database
 from .holidays import CALENDAR
 from .models import Task, combine
-from .recurrence import compute_next_at, next_occurrence
+from .recurrence import compute_next_at, next_occurrence, occurs_on
 
 TICK_MS = 10_000            # 10 秒扫一次，足够准且几乎不耗电
 CATCHUP_HOURS = 24          # 错过多久以内还补提醒
@@ -66,10 +66,69 @@ class ReminderScheduler(QObject):
 
     # ------------------------------------------------------------------ 生命周期
     def start(self, catch_up: bool = True) -> None:
+        # 先修历史数据：老版本有过一个 bug —— 重复任务标记完成后没有复位
+        # done 标志，导致任务永远卡在「已完成」、第二天再也不提醒。
+        # 这里在启动时把这类任务捞回来（详见 repair_stuck_completed）。
+        self.repair_stuck_completed()
         self.timer.start()
         if catch_up:
             # 启动时先补一次错过的
             QTimer.singleShot(1200, lambda: self.tick(force_catchup=True))
+
+    def repair_stuck_completed(self) -> int:
+        """把「卡住的重复任务」修回可提醒状态。
+
+        什么是卡住：下次提醒时间停在过去，任务既不会响、也不会自己恢复。
+        典型来源是更早版本的两个 bug：
+          * 完成后没有把 next_at 推到下一轮（弹过就一直停在过期时间）；
+          * 完成后把 done 抹成 0 与 done_date 打架（已完成筛选看不到）。
+
+        判定条件（满足其一）：
+          A. 下次提醒时间早于上次弹窗时间 —— 说明完成时的重排没生效
+          B. 完成日期在以前、且下次时间也在过去 —— 老数据遗留
+
+        修法：把 next_at 排到未来。
+        **不再动 done / done_date** —— 它们是完成事实的记录，
+        调度器用「done=1 且完成日期是过去」自然恢复（见 Database.active_tasks）。
+        返回修好的条数。
+        """
+        today = date.today().isoformat()
+        rows = self.db.conn.execute(
+            "SELECT * FROM tasks WHERE done=1 AND enabled=1 AND recur != ? "
+            "AND ("
+            # A：下次时间早于上次弹窗 -> 重排失败（含今天刚点完成的）
+            "  (last_fired_at IS NOT NULL AND next_at IS NOT NULL "
+            "   AND next_at < substr(last_fired_at,1,16))"
+            "  OR "
+            # B：老数据，完成日期在以前且下次时间也在过去
+            "  (next_at IS NOT NULL AND substr(next_at,1,10) < ? "
+            "   AND (done_date IS NULL OR done_date < ?))"
+            ")",
+            (cfg.RECUR_NONE, today, today)).fetchall()
+        fixed = 0
+        for row in rows:
+            t = Task.from_row(row)
+            try:
+                res = next_occurrence(t, after=date.today(), include_today=True)
+            except Exception as e:
+                # 规则异常读不出来就跳过这条，但留日志 —— 不然用户会觉得
+                # "这条任务莫名不提醒了"，却没有线索。
+                cfg.log_problem("repair_stuck_completed 算下次时间失败", e,
+                                f"task_id={t.id} recur={t.recur} "
+                                f"params={t.recur_params}")
+                continue
+            nxt = None
+            if res:
+                actual, _ = res
+                tt = t.first_time
+                nxt = f"{actual.isoformat()} {tt.hour:02d}:{tt.minute:02d}"
+            self.db.update_fields(t.id, next_at=nxt,
+                                  snooze_count=0, snooze_total_min=0)
+            self.db.log_fire(t.id, t.next_at, "repair", f"stuck -> {nxt}")
+            fixed += 1
+        if fixed:
+            self.db.conn.commit()
+        return fixed
 
     def stop(self) -> None:
         self.timer.stop()
@@ -141,8 +200,33 @@ class ReminderScheduler(QObject):
                     self.due.emit(t, now, False)
 
         # 4) 正常到点
+        today_iso = now.date().isoformat()
+        # 今天已经为哪些任务弹过（从 fire_log 查，作为"同一天不重复打扰"的兜底）。
+        # 为什么需要：_pending 只在内存里，程序重启或用户取消完成等操作会让它清空，
+        # 之后如果 next_at 又落到过去，调度器就会把同一条任务再弹一次。
+        fired_today: set[int] = set()
+        try:
+            for r in self.db.conn.execute(
+                    "SELECT DISTINCT task_id FROM fire_log "
+                    "WHERE kind IN ('popup','catchup') AND substr(fired_at,1,10)=? "
+                    "AND task_id IS NOT NULL", (today_iso,)):
+                fired_today.add(r["task_id"])
+        except Exception as e:
+            cfg.log_problem("查询今日已提醒记录失败", e)
+
         for t in self.db.tasks_with_next_at():
             if t.id in self._pending or t.id in self._snoozes:
+                continue
+            # 今天已经做过的就别再提醒了。
+            # 注：active/ tasks_with_next_at 会把"完成日期在过去"的任务也返回
+            # （那是为了新的一天能恢复提醒），所以这里要显式挡掉今天已完成的。
+            if t.done and t.done_date == today_iso:
+                continue
+            # 同一个任务今天已经提醒过 -> 不再重复弹。
+            # _pending 只活在内存里，程序重启、用户取消完成等操作会清掉它；
+            # 那时若 next_at 又落到过去，这条任务就会被再弹一次。
+            # 用 fire_log 里的当日记录兜底，保证"一天最多打扰一次"。
+            if t.id in fired_today:
                 continue
             ndt = t.next_dt
             if ndt is None:
@@ -157,6 +241,27 @@ class ReminderScheduler(QObject):
                 # 太久远了（超过一天），直接跳到下一个周期，避免开机弹一堆
                 self._advance(t, now)
                 continue
+
+            # ★ 刚开机/重启时，不为"已经过去很久"的提醒补弹窗。
+            #   场景：晚上 23:00 关机，有条当天没点完成的提醒；第二天开机时
+            #   它已经过去十几个小时，再弹窗已时过境迁，而且开机常会积压好几条，
+            #   会连续刷屏。处理方式：把下次提醒排到未来（界面里仍显示「未完成」，
+            #   到点照常提醒），只是不为它单独弹一次。
+            #   阈值取 1 小时（cfg.STARTUP_SILENT_MINUTES）：这样关机一晚会被静默，
+            #   但程序崩溃重开、临时关机十几分钟的情况仍会补提醒。
+            #   注意只在"启动/重启后"这样做：电脑一直开着时到点照弹，
+            #   休眠几分钟后唤醒也照弹（那种 overdue 很小，到不了阈值）。
+            if force_catchup and overdue > timedelta(
+                    minutes=cfg.STARTUP_SILENT_MINUTES):
+                cfg.log_problem(
+                    "启动时跳过过期提醒（不弹窗，保持未完成）",
+                    None,
+                    f"task_id={t.id} 标题={t.title!r} 原定={t.next_at} "
+                    f"已过去={overdue}")
+                self.db.log_fire(t.id, t.next_at, "advance", "启动时跳过过期提醒")
+                self._advance(t, now)
+                continue
+
             if overdue > timedelta(minutes=cfg.MISSED_GRACE_MINUTES):
                 # 错过了一段时间：补提醒
                 self._fire(t, now, catchup=True)
@@ -175,10 +280,17 @@ class ReminderScheduler(QObject):
 
     # ------------------------------------------------------------------ 内部
     def _on_new_day(self, now: datetime) -> None:
-        """跨天：清空"已弹过"标记，把昨天的任务重新排到今天。"""
+        """跨天：清空"已弹过"标记，把停在昨天的任务重排到今天。"""
         self._pending.clear()
         self._snoozes.clear()
         today = now.date().isoformat()
+
+        # 注意：**不要**在这里把 done 抹成 0。
+        # done=1 + done_date=昨天 已经能表达"上一轮做完了"，而
+        # Database.active_tasks() 会把这种任务视为可提醒（新的一天恢复了）。
+        # 抹成 0 反而会让 done 和 done_date 打架，导致
+        # 「已完成」筛选与「已完成」分组给出相反结论。
+
         for t in self.db.active_tasks():
             nxt = t.next_at or ""
             # 已经是今天或更晚的，不动；停在昨天的（昨天没做完的）重排到今天
@@ -211,28 +323,19 @@ class ReminderScheduler(QObject):
         self.due.emit(t, now, catchup)
 
     def _advance(self, t: Task, now: datetime) -> None:
-        """把任务的下次提醒时间推到未来（今天之后）并写库。"""
-        # 优先用当天剩下的追加时间点（一天多提醒）
-        if not t.done and t.enabled:
-            try:
-                nxt_extra = self.next_extra_slot(t, now)
-            except Exception:
-                nxt_extra = None
-            if nxt_extra and nxt_extra > now:
-                val = nxt_extra.strftime("%Y-%m-%d %H:%M")
-                self.db.update_fields(t.id, next_at=val)
-                t.next_at = val
-                return
+        """把任务的下次提醒时间推到未来并写库（允许排到今天剩下的时间点）。
 
-        # 否则找「明天及以后」的下一次
-        res = next_occurrence(t, after=now.date(), include_today=False)
-        nxt = None
-        if res:
-            actual, _ = res
-            tt = t.first_time
-            nxt = f"{actual.isoformat()} {tt.hour:02d}:{tt.minute:02d}"
-        self.db.update_fields(t.id, next_at=nxt)
-        t.next_at = nxt
+        用于两类场景：提醒弹过之后重排、启动时跳过过期提醒。
+        两者都必须"允许今天"—— 否则「每天 21:17」这种任务在早上触发时
+        会被直接推到明天，当天就再也不提醒了（这正是之前的 bug）。
+        """
+        if t.done:
+            # 已完成的任务不该再排回今天，交给 _reschedule_after_done 处理
+            self._reschedule_after_done(t, now, allow_today=False)
+            self.refreshed.emit()
+            return
+
+        self._reschedule_after_done(t, now, allow_today=True)
         self.refreshed.emit()
 
     # ------------------------------------------------------------------ 外部动作
@@ -244,13 +347,102 @@ class ReminderScheduler(QObject):
         self.db.mark_done(t, day=today, planned=planned or today,
                           was_deferred=self._is_deferred_now(t))
         self.db.log_fire(t.id, t.next_at, "popup", "done")
-        fresh = self.db.get_task(t.id)
-        if fresh:
-            if fresh.recur == cfg.RECUR_NONE:
-                self.db.update_fields(t.id, enabled=0, next_at=None)
-            else:
-                self._refresh_task_schedule(fresh)
+
+        if t.recur == cfg.RECUR_NONE:
+            # 一次性的：完成即停用
+            self.db.update_fields(t.id, enabled=0, next_at=None)
+        else:
+            # ★ 关键：重复任务完成后必须做两件事，少一件第二天就不会再提醒：
+            #   1) 把 next_at 推到「下一轮」—— 不能用 compute_next_at()，
+            #      它为了支持"错过补提醒"会把今天没到点的时间算回来，
+            #      于是任务会重新落到今天早上，等于没排下次；
+            #   2) **不要**把 done 抹成 0。done 是"本轮做完了"的真实记录，
+            #      调度器靠「done=1 且完成日期是过去」判断"新的一天该恢复了"
+            #      （见 Database.active_tasks）。抹成 0 会让 done 与 done_date
+            #      打架：任务显示在「已完成」组里，点「已完成」筛选却是空的。
+            #   allow_today=False：今天已经做完了，不该再排回今天。
+            self._reschedule_after_done(t, now=self._now(), allow_today=False)
         self.refreshed.emit()
+
+    def unmark_done_reschedule(self, t: Task) -> None:
+        """用户取消了「完成」：任务留在今天显示为未完成，但**不要**因此补弹提醒。
+
+        两个要求同时满足：
+          1. 它今天该做，所以必须还出现在「今天」列表里 —— 不能把 next_at
+             推到明天（那样用户会以为任务消失了）。所以这里刻意保留原定的
+             时间点，即使它已经过去（列表会把它显示为逾期）。
+          2. 取消勾选是"状态修正"操作，不该被当成"错过了提醒"而补弹。
+             靠两点保证：标记 _pending，以及 tick 里"同一天最多打扰一次"
+             （fire_log 有当日记录就不再弹）。
+
+        注意：本方法**自己负责清库**（done / done_date / completed_at 和
+        completion_log 记录），不要依赖调用方先调 unmark_done —— 依赖调用顺序
+        是隐患，测试里就因此暴露过一次不一致。
+        """
+        self.db.unmark_done(t)
+        self.db.update_fields(t.id, enabled=1)
+        # 保留"今天该做"的事实：把下次提醒放回今天（时分沿用原设定）
+        planned = t.next_at
+        if not planned or planned[:10] != date.today().isoformat():
+            tt = t.first_time
+            planned = f"{date.today().isoformat()} {tt.hour:02d}:{tt.minute:02d}"
+        self.db.update_fields(t.id, next_at=planned)
+        t.next_at = planned
+        t.done = False
+        t.done_date = None
+        t.completed_at = None
+        self._pending.add(t.id)      # 别让这次重排被当成新到点
+        self.refreshed.emit()
+
+    def _reschedule_after_done(self, t: Task, now: datetime | None = None,
+                               allow_today: bool = False) -> None:
+        """确定任务的「下一次提醒时间」并写库。
+
+        allow_today=True：允许排到今天（只要今天该提醒、且今天的某个时间点还没到）。
+        allow_today=False：严格排到明天及以后。
+
+        两种调用场景不一样，这个区分很重要：
+          * 用户点「完成」→ allow_today=False。今天已经做完了，不该再排回今天。
+          * 启动/跳过期提醒时重排 → allow_today=True。因为启动时可能只是
+            "错过了早上的那次"，而当天晚上的时间点还没到 —— 不能把今天
+            整个跳过。之前一律用"从明天开始找"，导致像「每天 21:17」这种
+            任务在早上开机时被直接推到明天，当天就再也不提醒了。
+        """
+        now = now or self._now()
+        today = now.date()
+        nxt = None
+
+        if allow_today:
+            # 先看今天是不是该提醒、以及今天还有没有没到的时间点
+            try:
+                if occurs_on(t, today):
+                    remaining = [tt for tt in t.times_as_time()
+                                 if datetime.combine(today, tt) > now]
+                    if remaining:
+                        nxt = datetime.combine(today, remaining[0]).strftime(
+                            "%Y-%m-%d %H:%M")
+            except Exception as e:
+                cfg.log_problem("_reschedule_after_done 判断今天是否可排失败", e,
+                                f"task_id={t.id} recur={t.recur}")
+
+        if nxt is None:
+            try:
+                res = next_occurrence(t, after=today, include_today=False)
+            except Exception as e:
+                cfg.log_problem("_reschedule_after_done 算下次时间失败", e,
+                                f"task_id={t.id} recur={t.recur}")
+                res = None
+            if res:
+                actual, _ = res
+                tt = t.first_time
+                nxt = f"{actual.isoformat()} {tt.hour:02d}:{tt.minute:02d}"
+
+        # 只改下次时间和稍后计数；done / done_date 保持不动（它们是完成事实的记录）
+        self.db.update_fields(t.id, next_at=nxt,
+                              snooze_count=0, snooze_total_min=0)
+        t.next_at = nxt
+        t.snooze_count = 0
+        t.snooze_total_min = 0
 
     def snooze(self, t: Task, minutes: int | None = None) -> None:
         """稍后提醒。"""
