@@ -81,6 +81,8 @@ BUILTIN: dict[int, tuple[list[str], list[str]]] = {
 # 年份里带「待补录」标记的，设置页会提示用户
 INCOMPLETE_YEARS = {2027}
 
+# 每个假期「有名字的那一天」，用来给整个假期区间命名
+# （下面 _build_holiday_names() 会把名字铺满到整个连续区间）
 HOLIDAY_NAMES: dict[str, str] = {
     "2025-01-01": "元旦",
     "2025-01-28": "除夕", "2025-01-29": "春节",
@@ -96,6 +98,38 @@ HOLIDAY_NAMES: dict[str, str] = {
     "2026-09-25": "中秋",
     "2026-10-01": "国庆",
 }
+
+
+def _build_holiday_names(holiday_dates: list[str]) -> dict[str, str]:
+    """给假期的每一天都取个名字（原来只标了第一天）。
+
+    为什么需要：9/25 有名字叫「中秋」，9/26、9/27 是同一个假期的后续天，
+    以前会退化成笼统的「法定假日」。用户看到"法定假日"会疑惑是哪个节，
+    所以这里把连续区间的所有天都铺上同一个名字。
+
+    相邻但不同节日（如 2025 国庆 10/1-10/5 与中秋 10/6-10/8）会正确分开：
+    连续块内部的成员是"连续日期"，而不同节日之间必然有名字冲突点，
+    用"从有名字的那天开始，名字不停往后延续，直到出现下一个有名字的天"来切块。
+    """
+    named = {s: nm for s, nm in HOLIDAY_NAMES.items() if s in set(holiday_dates)}
+    ordered = sorted(holiday_dates)
+    out: dict[str, str] = {}
+    current: str | None = None
+    prev: date | None = None
+    for s in ordered:
+        d = _d(s)
+        if s in named:
+            current = named[s]           # 遇到新的名字，换一个节日
+        elif prev is None or (d - prev).days > 1:
+            current = None               # 断开了且没有名字 -> 不硬编
+        if current:
+            out[s] = current
+        prev = d
+    # 没被命名的（比如用户自定义假日）保留原样，由调用方兜底
+    return out
+
+
+HOLIDAY_NAMES_FULL: dict[str, str] = {}
 
 # 补班日的说明（鼠标悬停/日志里可以用）
 MAKEUP_NOTES: dict[str, str] = {
@@ -130,9 +164,15 @@ class HolidayCalendar:
         self._makeup: set[date] = set()
         self._user_holidays: list[str] = []
         self._user_makeup: list[str] = []
+        # 给整个假期区间的每一天都取好名字（不只是第一天），
+        # 这样 9/26、9/27 会显示"中秋"而不是笼统的"法定假日"
+        all_holiday_dates = [s for hols, _ in BUILTIN.values() for s in hols]
+        names_full = _build_holiday_names(all_holiday_dates)
         for year, (hols, makes) in BUILTIN.items():
             for s in hols:
-                self._holidays[_d(s)] = HOLIDAY_NAMES.get(s, "法定假日")
+                self._holidays[_d(s)] = (names_full.get(s)
+                                        or HOLIDAY_NAMES.get(s)
+                                        or "法定假日")
             for s in makes:
                 self._makeup.add(_d(s))
         for s in extra_holidays or []:

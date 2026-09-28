@@ -40,12 +40,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     snooze_count    INTEGER DEFAULT 0,
     snooze_total_min INTEGER DEFAULT 0,
     created_at      TEXT,
-    sort_order      INTEGER DEFAULT 0
+    sort_order      INTEGER DEFAULT 0,
+    -- 来源：'local' = 自己加的；'class' = 老师通过班级通告下发的
+    source          TEXT DEFAULT 'local',
+    remote_id       INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_next   ON tasks(next_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_done   ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_tasks_recur  ON tasks(recur);
+-- 注意：source 列的索引不要写在这里。对"旧版本建的库"，CREATE TABLE IF NOT
+-- EXISTS 不会加新列，而这个建索引语句会先执行 -> 报 no such column: source，
+-- 程序直接打不开。索引改在 _migrate() 里补列之后再建。
 
 CREATE TABLE IF NOT EXISTS tags (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +85,22 @@ CREATE INDEX IF NOT EXISTS idx_log_actual ON completion_log(actual_date);
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT
+);
+
+-- 班级通告的本地缓存（从服务端同步下来的，服务端是唯一权威）
+CREATE TABLE IF NOT EXISTS class_announcements (
+    remote_id   INTEGER PRIMARY KEY,   -- 服务端给的通告 id
+    title       TEXT NOT NULL,
+    body        TEXT DEFAULT '',
+    author      TEXT DEFAULT '老师',
+    created_at  TEXT DEFAULT '',
+    read_at     TEXT                   -- 本地已读时间（不上传）
+);
+
+-- 同步状态：记录某个来源已经同步到哪个 id 了
+CREATE TABLE IF NOT EXISTS sync_state (
+    key   TEXT PRIMARY KEY,            -- 例如 announcement_last_id
+    value TEXT
 );
 
 -- 日志式记录每次提醒弹出，方便排查「为什么没提醒我」
@@ -135,6 +157,10 @@ class Database:
             "snooze_count": "INTEGER DEFAULT 0",
             "snooze_total_min": "INTEGER DEFAULT 0",
             "created_at": "TEXT", "sort_order": "INTEGER DEFAULT 0",
+            # 任务来源：'' / 'local' = 同学自己加的；'class' = 老师发的
+            "source": "TEXT DEFAULT 'local'",
+            # 老师发的任务在服务端的 id，用来去重和接收撤回
+            "remote_id": "INTEGER",
         }
         for col, ddl in wanted.items():
             if col not in have:
@@ -146,6 +172,13 @@ class Database:
         #   调度器应当把它当成可以再提醒的任务（见 active_tasks 的判定）。
         #   曾经误改成"有 done_date 就强制 done=1"，结果 active_tasks() 的
         #   查询条件 done=0 永远不成立，所有任务都不再被提醒。
+
+        # 索引要在补完列之后再建（放在 _SCHEMA 里会让旧库打不开，见上面的注释）
+        try:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source)")
+        except Exception as e:
+            cfg.log_problem("建 source 索引失败（不影响使用）", e)
         self.conn.commit()
         self.conn.commit()
 

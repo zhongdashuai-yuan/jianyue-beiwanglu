@@ -57,6 +57,57 @@ def step(name: str, fn):
         say("        " + traceback.format_exc().replace("\n", "\n        ")[:900])
 
 
+def _legacy_db_upgrade(tmp: Path):
+    """造一个老版本的 memo.db，确认新版程序能直接打开它。
+
+    老用户手里的库没有 source / remote_id 两列。如果新代码把
+    CREATE INDEX ... ON tasks(source) 写进建表语句里，打开老库会直接抛
+    "no such column: source"，用户双击程序没反应。索引必须挪到 _migrate()
+    里、等列补上之后再建。
+    """
+    import sqlite3
+
+    from app.database import Database
+
+    old_path = tmp / "legacy.db"
+    conn = sqlite3.connect(str(old_path))
+    conn.executescript("""
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            note TEXT, priority TEXT, category TEXT, tags TEXT, times TEXT,
+            lead_minutes INTEGER, recur TEXT, recur_params TEXT,
+            once_date TEXT, skip_dates TEXT, enabled INTEGER, next_at TEXT,
+            done INTEGER, done_date TEXT, snooze_count INTEGER,
+            snooze_total_min INTEGER, created_at TEXT, sort_order INTEGER
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (title, recur, times, enabled, done, created_at) "
+        "VALUES (?, ?, ?, 1, 0, ?)",
+        ("老用户的任务", "daily", '["09:00"]', "2026-01-01 08:00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    old_db = Database(old_path)
+    try:
+        cols = [r["name"] for r in old_db.conn.execute("PRAGMA table_info(tasks)")]
+        check("老库：source 列已自动补上", "source" in cols)
+        check("老库：remote_id 列已自动补上", "remote_id" in cols)
+
+        tasks = old_db.all_tasks()
+        check("老库：原有任务没丢", len(tasks) == 1 and tasks[0].title == "老用户的任务",
+              str([t.title for t in tasks]))
+        check("老库：老任务默认算作本机任务", bool(tasks) and tasks[0].source == "local")
+        check("老库：新表也建好了", old_db.conn is not None)
+        # source 上的索引是迁移之后才建的，能用就说明补列顺序没写反
+        old_db.conn.execute("SELECT id FROM tasks WHERE source='local'").fetchall()
+        check("老库：按 source 过滤能正常查", True)
+    finally:
+        old_db.close()
+
+
 def main() -> int:
     from app import config as cfg
     from app.database import Database
@@ -858,6 +909,125 @@ def main() -> int:
         db.delete_task(tid)
     step("取消勾选后留在今天且不补弹", _uncheck_no_popup)
 
+    def _single_notification():
+        """到点只提醒一次：自定义弹窗和系统通知不能同时出现。
+
+        真实反馈："为什么我预定的时间到了会有 2 个弹窗" ——
+        因为 on_due 里两个 if 各弹一次（右下角卡片 + Windows 通知横幅）。
+        现在两者互斥：卡片优先，关掉卡片才用系统通知兜底。
+        """
+        shown = {"popup": 0, "system": 0}
+
+        class _FakePopups:
+            def show_task(self, task, catchup=False):
+                shown["popup"] += 1
+
+        real_notify = win.notify_system
+        real_popups = win._popups
+        real_sound = settings.get("sound_enabled", True)
+        try:
+            win._popups = _FakePopups()
+            win.notify_system = lambda task, catchup=False: shown.__setitem__(
+                "system", shown["system"] + 1)
+            settings.set("sound_enabled", False)
+
+            t = db.get_task(db.all_tasks()[0].id) if db.all_tasks() else None
+            assert t is not None, "数据库里没有任务，无法测试"
+
+            # 场景一：两个都开 -> 只弹卡片
+            settings.set("popup_enabled", True)
+            settings.set("system_notify_enabled", True)
+            shown["popup"] = shown["system"] = 0
+            win.on_due(t, datetime.now(), False)
+            assert shown["popup"] == 1 and shown["system"] == 0, \
+                f"两者都开时应只弹卡片，实际 卡片={shown['popup']} 通知={shown['system']}"
+
+            # 场景二：关掉卡片 -> 用系统通知兜底
+            settings.set("popup_enabled", False)
+            settings.set("system_notify_enabled", True)
+            shown["popup"] = shown["system"] = 0
+            win.on_due(t, datetime.now(), False)
+            assert shown["popup"] == 0 and shown["system"] == 1, \
+                f"关掉卡片时应弹系统通知，实际 卡片={shown['popup']} 通知={shown['system']}"
+
+            # 场景三：两个都关 -> 谁都不弹（但不应报错）
+            settings.set("popup_enabled", False)
+            settings.set("system_notify_enabled", False)
+            shown["popup"] = shown["system"] = 0
+            win.on_due(t, datetime.now(), False)
+            assert shown["popup"] == 0 and shown["system"] == 0, \
+                "两个都关时不该弹任何提醒"
+        finally:
+            win.notify_system = real_notify
+            win._popups = real_popups
+            settings.set("sound_enabled", real_sound)
+            settings.set("popup_enabled", True)
+            settings.set("system_notify_enabled", False)
+    step("到点只提醒一次（卡片与系统通知互斥）", _single_notification)
+
+    def _notify_defaults():
+        """默认配置必须是"只用自定义弹窗"，不要系统通知。
+
+        用户明确表示只要弹窗，不要 Windows 横幅。
+        另外要保证内部标记（"_" 开头）能存进设置文件 ——
+        以前 Settings.load 只认识默认表里的键，会把这些标记丢掉，
+        导致一次性迁移每次启动都重跑一遍。
+        """
+        assert cfg.DEFAULT_UI_SETTINGS["popup_enabled"] is True, \
+            "自定义弹窗默认应为开启"
+        assert cfg.DEFAULT_UI_SETTINGS["system_notify_enabled"] is False, \
+            "系统通知默认应为关闭（用户只要自定义弹窗）"
+
+        # 内部标记要能持久化
+        import tempfile
+        from pathlib import Path as _P
+        tmp = _P(tempfile.mkdtemp(prefix="memo_cfg_")) / "ui.json"
+        s1 = cfg.Settings(tmp)
+        assert s1.get("system_notify_enabled", None) is False, \
+            "新建设置时系统通知应为关闭"
+        s1.update(_notify_migrated_v1=True, custom_key="should_be_ignored")
+        s2 = cfg.Settings(tmp)
+        assert s2.get("_notify_migrated_v1") is True, \
+            "内部标记（_ 开头）没能存进设置文件，迁移会每次重跑"
+        assert s2.get("custom_key", "absent") == "absent", \
+            "非默认表的普通键不该被保留"
+    step("默认只用自定义弹窗（系统通知默认关闭）", _notify_defaults)
+
+    def _holiday_naming_and_weekend():
+        """假期整个区间都要有正确的节日名；"周末也要上班"不该覆盖法定假日。
+
+        真实反馈：编辑对话框里 9/27（周日）显示"因假期顺延"，用户以为
+        勾了「我周末也要上班」就该变回当天。实际 9/27 属于中秋假期区间，
+        法定假日优先级高于"周末上班"，顺延是对的 —— 但界面上把它显示成
+        "法定假日"而不是"中秋"，让人搞不清是哪个节，所以顺带修了命名。
+        """
+        from app.holidays import CALENDAR, HolidayCalendar
+
+        # 1) 假期整个区间都带节日名（不只是第一天）
+        assert CALENDAR.holiday_name(date(2026, 9, 25)) == "中秋"
+        assert CALENDAR.holiday_name(date(2026, 9, 26)) == "中秋", \
+            "假期第二天应继承节日名（原来退化成'法定假日'）"
+        assert CALENDAR.holiday_name(date(2026, 9, 27)) == "中秋"
+        assert CALENDAR.holiday_name(date(2026, 2, 20)) == "春节"
+        assert CALENDAR.holiday_name(date(2026, 10, 5)) == "国庆"
+        # 2025 国庆与中秋是两段，不能混成一个名字
+        assert CALENDAR.holiday_name(date(2025, 10, 5)) == "国庆"
+        assert CALENDAR.holiday_name(date(2025, 10, 6)) == "中秋"
+
+        # 2) work_weekend 只影响"普通周末"，不影响法定假日
+        cal_ww = HolidayCalendar(work_weekend=True)
+        sat_normal = date(2026, 3, 7)        # 普通周六，非假期
+        assert cal_ww.is_workday(sat_normal), \
+            "开了「周末也要上班」后，普通周六应算工作日"
+        assert cal_ww.is_workday(date(2026, 3, 2)), "普通周一应算工作日"
+        assert not cal_ww.is_workday(date(2026, 9, 27)), \
+            "9/27 是中秋假期，即使周末上班也仍是休息日（法定假日优先）"
+        assert not cal_ww.is_workday(date(2026, 10, 5)), \
+            "10/5 是国庆假期，即使周末上班也仍是休息日"
+        # 补班日照样算上班
+        assert cal_ww.is_workday(date(2026, 10, 10)), "调休补班日应算工作日"
+    step("假期区间命名 + 周末上班与法定假日的优先级", _holiday_naming_and_weekend)
+
     def _filter_buttons_after_refresh():
         """按钮文字被改成带数量之后，再点一次 —— 就是当初崩掉的场景。"""
         lv = win.list_view
@@ -973,6 +1143,9 @@ def main() -> int:
     check("备份文件生成", p is not None and Path(p).exists())
 
     db.close()
+
+    say("\n=== 7. 老版本数据库升级 ===")
+    step("老数据库能直接打开并自动补列", lambda: _legacy_db_upgrade(tmp))
 
     print("\n" + "=" * 60)
     say("\n" + "=" * 60)

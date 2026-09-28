@@ -62,6 +62,9 @@ class Task:
     snooze_total_min: int = 0
     created_at: str = ""
     sort_order: int = 0
+    # 来源：'local' = 自己加的；'class' = 老师通过班级通告下发的
+    source: str = "local"
+    remote_id: int | None = None       # 老师那条任务在服务端的 id
 
     # ---------------- 序列化 ----------------
     @staticmethod
@@ -108,6 +111,8 @@ class Task:
             snooze_total_min=d.get("snooze_total_min") or 0,
             created_at=d.get("created_at") or "",
             sort_order=d.get("sort_order") or 0,
+            source=d.get("source") or "local",
+            remote_id=d.get("remote_id"),
         )
 
     def to_row(self) -> dict:
@@ -135,7 +140,14 @@ class Task:
             "snooze_total_min": int(self.snooze_total_min or 0),
             "created_at": self.created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "sort_order": int(self.sort_order or 0),
+            "source": self.source or "local",
+            "remote_id": self.remote_id,
         }
+
+    @property
+    def is_class_task(self) -> bool:
+        """是不是老师通过班级通告下发的任务（这种任务同学不能删）。"""
+        return (self.source or "local") == "class"
 
     # ---------------- 便捷属性 ----------------
     @property

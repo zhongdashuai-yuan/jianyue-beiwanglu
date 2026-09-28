@@ -100,6 +100,14 @@ def main() -> int:
             set_autostart(True)
         settings.set("_first_run_done", True)
 
+    # ---- 一次性迁移：关掉系统通知，只用自定义弹窗 ----
+    # 以前"自定义弹窗 + Windows 系统通知"两个都开着，到点会同时弹两样，
+    # 用户反馈"为什么到了时间有 2 个弹窗"。现在统一成只用弹窗。
+    # 只做一次（用标记位），之后用户自己在设置里怎么改都尊重。
+    if not settings.get("_notify_migrated_v1", False):
+        settings.update(system_notify_enabled=False, popup_enabled=True,
+                        _notify_migrated_v1=True)
+
     # ---- 主题 ----
     theme = ThemeManager(app, settings)
     theme.apply()
@@ -108,9 +116,23 @@ def main() -> int:
     if not cfg.ICON_PATH.exists():
         save_ico(cfg.ICON_PATH)
 
+    # ---- 班级通告同步 ----
+    from app.class_sync import ClassSync
+    class_sync = ClassSync(db, settings)
+
     # ---- 主窗口 + 调度器 ----
     scheduler = ReminderScheduler(db, settings)
-    win = MainWindow(db, scheduler, theme, settings)
+    win = MainWindow(db, scheduler, theme, settings, class_sync=class_sync)
+
+    # 同步完成后刷新「班级」页和侧边栏未读数
+    def on_class_synced(result):
+        try:
+            if win.class_view is not None:
+                win.class_view.refresh(result)
+            win.refresh_all()
+        except Exception as e:
+            cfg.log_problem("班级同步后刷新界面失败", e)
+    class_sync.start_auto(on_class_synced)
 
     # ---- 提醒弹窗管理 ----
     def on_popup_done(task_id: int):

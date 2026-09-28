@@ -31,6 +31,7 @@ from ..models import Task
 from ..recurrence import compute_next_at, describe
 from ..theme import make_icon
 from . import dialogs
+from .class_view import ClassView
 from .views import CalendarView, ListView, StatsView
 from .widgets import EmptyState, RingProgress, chip, soft_shadow
 
@@ -93,7 +94,7 @@ class Sidebar(QFrame):
         self.nav_group = QButtonGroup(self)
         self.nav_buttons: dict[str, QPushButton] = {}
         for key, icon, label in (("list", "📋", "列表"), ("calendar", "📅", "日历"),
-                                 ("stats", "📊", "统计")):
+                                 ("stats", "📊", "统计"), ("class", "📣", "班级")):
             b = QPushButton(f"  {icon}   {label}")
             b.setObjectName("NavItem")
             b.setCheckable(True)
@@ -206,12 +207,13 @@ class MainWindow(QWidget):
 
     quit_requested = Signal()
 
-    def __init__(self, db, scheduler, theme, settings, parent=None):
+    def __init__(self, db, scheduler, theme, settings, parent=None, class_sync=None):
         super().__init__(parent)
         self.db = db
         self.scheduler = scheduler
         self.theme = theme
         self.settings = settings
+        self.class_sync = class_sync     # 班级同步对象；None 表示不启用班级页
         self._force_quit = False
         self._popups = None          # 由 main.py 注入的 PopupManager
 
@@ -285,7 +287,18 @@ class MainWindow(QWidget):
         self.list_view = ListView(db, scheduler, theme, settings)
         self.calendar_view = CalendarView(db, scheduler, theme, settings)
         self.stats_view = StatsView(db, scheduler, theme, settings)
-        for v in (self.list_view, self.calendar_view, self.stats_view):
+        # 班级通告页：需要同步对象；没传时不崩（冒烟测试里就不传）
+        self.class_view = ClassView(db, class_sync, theme, settings) \
+            if class_sync is not None else None
+        self._page_order = ["list", "calendar", "stats"]
+        self._page_titles = {"list": "列表", "calendar": "日历", "stats": "统计"}
+        views = [self.list_view, self.calendar_view, self.stats_view]
+        if self.class_view is not None:
+            self._page_order.append("class")
+            self._page_titles["class"] = "班级"
+            views.append(self.class_view)
+            self.class_view.on_open_setup = self.open_settings
+        for v in views:
             self.stack.addWidget(v)
         content.addWidget(self.stack, 1)
 
@@ -317,11 +330,12 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------ 页面
     def switch_page(self, key: str):
-        idx = {"list": 0, "calendar": 1, "stats": 2}.get(key, 0)
+        if key not in self._page_order:
+            key = "list"
+        idx = self._page_order.index(key)
         self.stack.setCurrentIndex(idx)
-        self.sidebar.set_active(("list", "calendar", "stats")[idx])
-        self.lbl_title.setText({"list": "列表", "calendar": "日历", "stats": "统计"}[
-            ("list", "calendar", "stats")[idx]])
+        self.sidebar.set_active(key)
+        self.lbl_title.setText(self._page_titles.get(key, ""))
         self.settings.set("last_page", key)
         # 淡入 + 右移 8px 的切换动画
         w = self.stack.currentWidget()
@@ -360,23 +374,54 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------ 刷新
     def refresh_all(self):
         self.sidebar.refresh_overview()
-        idx = self.stack.currentIndex()
-        if idx == 0:
+        key = self._page_order[self.stack.currentIndex()] \
+            if 0 <= self.stack.currentIndex() < len(self._page_order) else "list"
+        if key == "list":
             self.list_view.refresh()
-        elif idx == 1:
+        elif key == "calendar":
             self.calendar_view.refresh()
-        else:
+        elif key == "stats":
             self.stats_view.refresh()
+        elif key == "class" and self.class_view is not None:
+            self.class_view.refresh()
+        # 侧边栏「班级」项显示未读数
+        self._update_class_badge()
         st = stats_mod.day_stats(self.db, date.today())
         self.lbl_sub.setText(f"今天 {st['done']}/{st['total']} 已完成")
 
+    def _update_class_badge(self):
+        """给侧边栏的「班级」加未读数，例如「📣   班级 (2)」。"""
+        btn = self.sidebar.nav_buttons.get("class")
+        if btn is None:
+            return
+        n = 0
+        if self.class_view is not None:
+            try:
+                n = self.class_view.sync.unread_count()
+            except Exception:
+                n = 0
+        btn.setText(f"  📣   班级" + (f" ({n})" if n else ""))
+
     # ------------------------------------------------------------------ 提醒
     def on_due(self, task, when, catchup: bool):
-        """调度器说该提醒了 —— 弹窗 + 系统通知 + 提示音。"""
-        if self.settings.get("popup_enabled", True) and self._popups is not None:
+        """调度器说该提醒了 —— 弹窗 / 系统通知 / 提示音。
+
+        注意：**自定义弹窗和系统通知只出其中一个**，不要两个同时弹。
+        两者都开时以前会同时出现两张提醒（右下角卡片 + Windows 横幅），
+        用户会以为程序出 bug 了（"为什么到了时间有 2 个弹窗"）。
+        优先级：自定义弹窗 > 系统通知 —— 因为卡片上有「完成 / 稍后 / 跳过」
+        按钮，比只能看看的系统横幅更有用。
+        """
+        popup_on = (self.settings.get("popup_enabled", True)
+                    and self._popups is not None)
+        notify_on = self.settings.get("system_notify_enabled", True)
+
+        if popup_on:
             self._popups.show_task(task, catchup)
-        if self.settings.get("system_notify_enabled", True):
+        elif notify_on:
+            # 只有在没启用自定义弹窗时，才用系统通知兜底
             self.notify_system(task, catchup)
+
         if self.settings.get("sound_enabled", True):
             self.play_sound()
         self.refresh_all()
@@ -474,6 +519,15 @@ class MainWindow(QWidget):
         t = self.db.get_task(task_id)
         if not t:
             return
+        # 老师发的班级任务不给删：同学误删了就会漏做作业，而且下次同步又会回来。
+        # 想让它消失只能由老师撤回（撤回后下次同步会自动删掉）。
+        if t.is_class_task:
+            QMessageBox.information(
+                self, "这条是老师发的",
+                f"「{t.title}」是老师通过班级通告发下来的任务，不能删除。\n\n"
+                "如果你想让它不再提醒，可以点它的圆圈标记完成；\n"
+                "如果这条已经不需要了，请让老师撤回。")
+            return
         if QMessageBox.question(self, "删除提醒",
                                 f"确定删除「{t.title}」吗？\n删除后无法恢复。",
                                 QMessageBox.Yes | QMessageBox.No,
@@ -526,6 +580,32 @@ class MainWindow(QWidget):
 # ===========================================================================
 # 设置对话框
 # ===========================================================================
+
+class _ProbeSettings:
+    """「测试连接」时用的临时设置：只在内存里，不写用户配置文件。
+
+    这样同学可以先试通再保存；万一填错了也不会把坏配置存进去。
+    device_id 复用真实配置里的值，保证服务端认得出是同一台设备。
+    """
+
+    def __init__(self, url: str, key: str, name: str, real=None):
+        self._d = {"class_server_url": url, "class_join_key": key,
+                   "class_student_name": name, "class_device_id":
+                       (real or {}).get("class_device_id", "") or "probe-device",
+                   "class_enabled": True}
+
+    def get(self, k, d=None):
+        return self._d.get(k, d)
+
+    def set(self, k, v):
+        self._d[k] = v
+
+    def update(self, **kw):
+        self._d.update(kw)
+
+    def save(self):
+        pass
+
 
 class SettingsDialog(QDialog):
     """设置：外观 / 提醒方式 / 新任务默认值 / 节假日 / 数据 / 开机自启。"""
@@ -589,12 +669,20 @@ class SettingsDialog(QDialog):
         # ---------------- 提醒方式 ----------------
         bl.addWidget(self._div(c))
         bl.addWidget(self._sec("提醒方式", c))
-        self.chk_popup = QCheckBox("弹出右下角提醒卡片")
+        self.chk_popup = QCheckBox("弹出右下角提醒卡片（带「完成 / 稍后 / 跳过」按钮）")
         self.chk_popup.setChecked(bool(settings.get("popup_enabled", True)))
         bl.addWidget(self.chk_popup)
 
-        self.chk_system = QCheckBox("发送 Windows 系统通知（会在通知中心留记录）")
-        self.chk_system.setChecked(bool(settings.get("system_notify_enabled", True)))
+        # 说明两者不会同时出现，避免用户以为弹了两个是 bug
+        hint_popup = QLabel("上面两项只生效其中一个：开了提醒卡片就用卡片，"
+                            "关掉卡片才用系统通知。默认只用卡片。")
+        hint_popup.setObjectName("Muted")
+        hint_popup.setWordWrap(True)
+        bl.addWidget(hint_popup)
+
+        self.chk_system = QCheckBox("改用 Windows 系统通知"
+                                   "（默认关闭；开启后会进系统通知中心留记录）")
+        self.chk_system.setChecked(bool(settings.get("system_notify_enabled", False)))
         bl.addWidget(self.chk_system)
 
         self.chk_sound = QCheckBox("播放提示音")
@@ -694,6 +782,48 @@ class SettingsDialog(QDialog):
         self.txt_makeup.setPlainText("\n".join(self.settings.get("extra_makeup", []) or []))
         bl.addWidget(self.txt_makeup)
 
+        # ---------------- 班级接入 ----------------
+        bl.addWidget(self._div(c))
+        bl.addWidget(self._sec("班级通告（老师发、同学收）", c))
+        tip = QLabel("把老师给你的「服务器地址」和「接入密钥」填在这里，"
+                     "就能收到老师发的通告和班级任务。不填也能正常用，"
+                     "只是收不到班级内容。")
+        tip.setObjectName("Muted")
+        tip.setWordWrap(True)
+        bl.addWidget(tip)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("服务器地址"))
+        self.edit_class_url = QLineEdit(settings.get("class_server_url", ""))
+        self.edit_class_url.setPlaceholderText("例如 http://192.168.1.5:8765")
+        row.addWidget(self.edit_class_url, 1)
+        bl.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("接入密钥"))
+        self.edit_class_key = QLineEdit(settings.get("class_join_key", ""))
+        self.edit_class_key.setPlaceholderText("老师发给你的那串码，例如 MEMO-XXXXXX")
+        row.addWidget(self.edit_class_key, 1)
+        bl.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("你的名字（可留空）"))
+        self.edit_class_name = QLineEdit(settings.get("class_student_name", ""))
+        self.edit_class_name.setPlaceholderText("填了老师能看到谁接入了；留空也能收通告")
+        row.addWidget(self.edit_class_name, 1)
+        bl.addLayout(row)
+
+        crow = QHBoxLayout()
+        self.btn_class_test = QPushButton("测试连接")
+        self.btn_class_test.setCursor(Qt.PointingHandCursor)
+        self.btn_class_test.clicked.connect(self._test_class_connection)
+        crow.addWidget(self.btn_class_test)
+        self.lbl_class_test = QLabel("")
+        self.lbl_class_test.setObjectName("Sub")
+        self.lbl_class_test.setWordWrap(True)
+        crow.addWidget(self.lbl_class_test, 1)
+        bl.addLayout(crow)
+
         # ---------------- 启动 ----------------
         bl.addWidget(self._div(c))
         bl.addWidget(self._sec("启动", c))
@@ -763,6 +893,27 @@ class SettingsDialog(QDialog):
         from ..reminder import play_chime
         if not play_chime():
             self.lbl_data_msg.setText("提示音播放失败（系统不支持）")
+
+    def _test_class_connection(self):
+        """用当前填写的地址/密钥试连一次，结果只显示在这行文字里。"""
+        from ..class_sync import ClassSync
+        url = self.edit_class_url.text().strip()
+        key = self.edit_class_key.text().strip()
+        if not url or not key:
+            self.lbl_class_test.setText("请先填服务器地址和接入密钥")
+            return
+        # 用临时设置在内存里试，不写进用户配置（点保存才写）
+        probe = ClassSync(self.db, self.settings)
+        probe.settings = _ProbeSettings(url, key,
+                                        self.edit_class_name.text().strip(),
+                                        self.settings.as_dict())
+        self.lbl_class_test.setText("正在连接…")
+        QApplication.processEvents()
+        res = probe.test_connection()
+        if res.ok:
+            self.lbl_class_test.setText("✓ 连接成功，密钥有效")
+        else:
+            self.lbl_class_test.setText(f"✗ {res.error}")
 
     def _do_backup(self):
         p = self.db.backup()
@@ -834,7 +985,16 @@ class SettingsDialog(QDialog):
             extra_holidays=extra_h,
             extra_makeup=extra_m,
             autostart=self.chk_autostart.isChecked(),
+            # ---- 班级接入 ----
+            class_server_url=self.edit_class_url.text().strip().rstrip("/"),
+            class_join_key=self.edit_class_key.text().strip(),
+            class_student_name=self.edit_class_name.text().strip(),
+            class_enabled=bool(self.edit_class_url.text().strip()
+                               and self.edit_class_key.text().strip()),
         )
+        # 新接入时要生成设备标识，否则服务端看不到这台设备
+        from ..class_sync import ClassSync
+        ClassSync(self.db, self.settings)._ensure_device_id()
         reload_calendar(extra_h, extra_m, work_weekend)
         set_autostart(self.chk_autostart.isChecked())
         self.theme.settings = self.settings

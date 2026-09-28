@@ -9,6 +9,7 @@ env/
 # ---- PyInstaller 构建产物（约 274MB，不进仓库）----
 build/
 dist/
+dist_onefile/
 *.manifest
 
 # ---- 运行期数据（本地数据，绝不提交）----
@@ -22,6 +23,10 @@ backup/
 smoke_report.txt
 tools/_*.txt
 tools/_*.log
+tools/_*_report.txt
+
+# ---- 班级服务端数据（含管理员密钥，绝不提交）----
+server/server_data/
 
 # ---- 编辑器 / 系统 ----
 .idea/

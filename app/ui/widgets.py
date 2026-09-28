@@ -372,6 +372,16 @@ class TaskCard(QFrame):
         self.lbl_meta.setObjectName("Muted")
         line2.addWidget(self.lbl_meta)
 
+        # 老师发的任务标出来源，让同学一眼看出这条不是自己加的
+        if task.is_class_task:
+            badge = QLabel("老师")
+            badge.setStyleSheet(
+                f"color: {theme.c['accent_press']};"
+                f" border: 1px solid {theme.c['accent']};"
+                f" border-radius: 8px; padding: 0px 6px; font-size: 10px;")
+            badge.setFixedHeight(16)
+            line2.addWidget(badge)
+
         # 只有"今天完成"才显示完成时间。用 done_today 而不是 task.done ——
         # 否则昨天打了勾的每日任务，今天会显示"✓ 昨天17:18 完成"，看起来像今天做完了。
         if done_today and task.completed_at:

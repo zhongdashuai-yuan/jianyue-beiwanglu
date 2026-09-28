@@ -210,8 +210,10 @@ DEFAULT_UI_SETTINGS: dict = {
     "autostart": True,            # 开机自启（用户已确认要）
     "minimize_to_tray": True,     # 关窗口时最小化到托盘而不是退出
     "sound_enabled": True,        # 提示音
-    "popup_enabled": True,        # 右下角自定义弹窗
-    "system_notify_enabled": True,  # Windows 原生通知
+    "popup_enabled": True,        # 右下角自定义弹窗（主要提醒方式）
+    # 系统通知默认关闭：用户明确表示只要自定义弹窗，不要 Windows 横幅。
+    # 开关保留着，以后若想"同时在通知中心留一条记录"可以自己开回来。
+    "system_notify_enabled": False,
     "popup_auto_close_sec": 20,   # 弹窗自动淡出秒数（0=不自动关）
     "popup_max_stack": 3,         # 同屏最多叠几张提醒卡片
     "snooze_minutes": 10,         # 上次用的稍后档位
@@ -226,6 +228,14 @@ DEFAULT_UI_SETTINGS: dict = {
     "last_page": "list",
     "tag_filter": [],             # 上次选中的标签
     "ref_biweek_date": "2026-01-05",  # 单双周基准（2026-01-05 是 ISO 第 2 周）
+
+    # ---- 班级通告（老师发、同学收）----
+    "class_enabled": False,       # 是否接入班级同步（默认关，填了地址密钥才开）
+    "class_server_url": "",       # 老师服务端地址，如 http://192.168.1.5:8765
+    "class_join_key": "",         # 老师发的接入密钥
+    "class_student_name": "",     # 可选，填了老师在服务端能看到谁接入了
+    "class_device_id": "",        # 本机标识，首次使用时自动生成
+    "class_admin_key": "",        # 老师端才填：管理员密钥（普通同学不要填）
 }
 
 AUTOSTART_REG_NAME = "MemoReminder"          # HKCU\...\Run 里的键名
@@ -276,10 +286,11 @@ class Settings:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    # 只认识默认表里有的键，避免旧版本脏数据搞崩程序
-                    for k in DEFAULT_UI_SETTINGS:
-                        if k in raw:
-                            self._data[k] = raw[k]
+                    # 默认表里的键正常读；另外保留以 "_" 开头的内部标记
+                    # （例如 _first_run_done、迁移标记），只持久化这些，不开放任意键
+                    for k, v in raw.items():
+                        if k in DEFAULT_UI_SETTINGS or k.startswith("_"):
+                            self._data[k] = v
         except Exception:
             pass  # 设置文件坏了就用默认值，不打扰用户
 
