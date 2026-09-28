@@ -70,6 +70,8 @@ set MEMO_ONEFILE=1 && build_exe.bat     # 单文件版（好拷贝）
 | `app/class_sync.py` | 班级模式客户端：增量拉取老师的通告与作业，离线静默降级 |
 | `server/server.py` | 班级模式服务端：纯标准库（`http.server` + `sqlite3`），双密钥、限流 |
 | `server/send.py` | 老师用的命令行发送工具（发通告 / 发作业 / 撤回 / 看谁接入了） |
+| `app/admin_api.py` | 老师端管理接口：拿管理员密钥发内容、撤回、拉名单（只走 HTTP，不碰服务端数据库） |
+| `app/ui/admin_view.py` | 老师端「管理」页：发通告 / 发任务 / 撤回 / 接入名单 |
 
 几个设计取舍：
 
@@ -80,6 +82,8 @@ set MEMO_ONEFILE=1 && build_exe.bat     # 单文件版（好拷贝）
 - 提醒弹窗 `WA_ShowWithoutActivating`，**不抢焦点**；鼠标移上去会暂停自动关闭
 - **服务端是班级内容的唯一权威**：同学本地只是缓存，删不掉老师发的任务，
   撤回后本地也会跟着消失
+- **「管理」页只走 HTTP 接口**，不直接读写服务端数据库 —— 用的就是 `send.py`
+  那套接口，不会出现"命令行发得出去、界面上发不出去"的两套逻辑
 
 ## 班级模式
 
@@ -90,13 +94,34 @@ set MEMO_ONEFILE=1 && build_exe.bat     # 单文件版（好拷贝）
 
 ```bash
 python server/server.py                 # 启动，会打印管理员密钥、接入密钥和局域网地址
+```
+
+发内容有两种方式，走同一套接口：
+
+- **程序里的「管理」页**（推荐）：设置里填上服务器地址 + **管理员密钥**，
+  左侧就会出现 🛠️ **管理**，可以发通告、发任务、撤回、看接入名单
+- **命令行**：
+
+```bash
 python server/send.py announcement "明天交作业" "第 3 章习题，拍照上传"
 python server/send.py task "周五交读书笔记" --recur once --date 2026-10-09 --time 19:00
 python server/send.py members           # 看谁接入了
 python server/send.py withdraw-ann 1    # 撤回发错的通告
 ```
 
-按老师给的地址，同学端**设置 → 班级接入**里填服务器地址 + 接入密钥即可。
+老师端的「管理」页（填了管理员密钥才会出现）：
+
+| 发通告 / 发任务 | 已发布（可撤回） | 接入名单 |
+|---|---|---|
+| ![管理页](preview/gui_admin_publish.png) | ![已发布](preview/gui_admin_list.png) | ![接入名单](preview/gui_admin_members.png) |
+
+上面三张是离屏渲染的效果图；下面是**打包好的 exe 真跑起来**、连上服务端之后的样子
+（状态栏能看到实时统计）：
+
+![打包版实机](preview/deployed_admin.png)
+
+按老师给的地址，同学端**设置 → 班级接入**里填服务器地址 + 接入密钥即可
+（**管理员密钥不要给同学**，填了才会出现「管理」页）。
 详细步骤、防火墙放行命令见 [`server/使用说明.md`](server/使用说明.md)。
 
 > ⚠️ **几个必须知道的限制**，别踩了才后悔：
@@ -110,10 +135,11 @@ python server/send.py withdraw-ann 1    # 撤回发错的通告
 ## 测试
 
 ```bash
-python tools/smoke_test.py        # 93 项：重复规则/节假日/统计/界面构造/老库升级，秒级
-python tools/test_server.py       # 22 项：服务端接口、双密钥、限流
-python tools/test_class_sync.py   # 53 项：端到端同步 + 班级页各种通告形状
-python tools/test_send_cli.py     # 17 项：老师命令行工具
+python tools/smoke_test.py        # 100 项：重复规则/节假日/统计/界面构造/老库升级/管理页显隐
+python tools/test_server.py       #  38 项：服务端接口、双密钥、只读与管理列表、限流
+python tools/test_class_sync.py   #  53 项：端到端同步 + 班级页各种通告形状
+python tools/test_send_cli.py     #  17 项：老师命令行工具
+python tools/test_admin.py        #  50 项：老师端管理页（真构造控件、真起服务端）
 python tools/verify_reminder.py   # 端到端：真的把程序跑起来，验证提醒会弹（约 100 秒）
 python tools/render_preview.py    # 离屏渲染界面截图，不需要显示器
 python tools/seed_data.py         # 造示例数据
@@ -122,7 +148,7 @@ python tools/seed_data.py         # 造示例数据
 `verify_reminder.py` 是当初抓到一个真 bug 的工具：提醒弹出后没有推进下次时间，
 导致同一条任务每 10 秒重复弹一次刷屏。现在它作为回归测试保留。
 
-测试有两条自己踩出来的规矩，改代码时请照做：
+测试有三条自己踩出来的规矩，改代码时请照做：
 
 1. **新写的回归测试，要把 bug 塞回去跑一遍，确认它真的会失败。**
    曾经有两个版本的柱状图测试是"永远通过"的假测试，白高兴一场。
@@ -130,6 +156,9 @@ python tools/seed_data.py         # 造示例数据
    `AnnouncementCard` 曾把 `_refresh_body()` 写在 `self.hint` 创建之前，
    只要有**一条带正文的通告**，同学一点开「班级」页就崩 ——
    而当时所有纯逻辑测试全是绿的，因为没人真去构造那个卡片。
+3. **同一件事只能有一处判定逻辑，否则测试会被"兜住"。**
+   「管理」页的显隐一度有两道（侧边栏默认隐藏 + `_update_admin_nav()`），
+   结果改坏其中一道，测试照样全绿。现在只留 `_update_admin_nav()` 一处。
 
 ## 踩坑记录
 

@@ -31,6 +31,7 @@ from ..models import Task
 from ..recurrence import compute_next_at, describe
 from ..theme import make_icon
 from . import dialogs
+from .admin_view import AdminView
 from .class_view import ClassView
 from .views import CalendarView, ListView, StatsView
 from .widgets import EmptyState, RingProgress, chip, soft_shadow
@@ -94,7 +95,8 @@ class Sidebar(QFrame):
         self.nav_group = QButtonGroup(self)
         self.nav_buttons: dict[str, QPushButton] = {}
         for key, icon, label in (("list", "📋", "列表"), ("calendar", "📅", "日历"),
-                                 ("stats", "📊", "统计"), ("class", "📣", "班级")):
+                                 ("stats", "📊", "统计"), ("class", "📣", "班级"),
+                                 ("admin", "🛠️", "管理")):
             b = QPushButton(f"  {icon}   {label}")
             b.setObjectName("NavItem")
             b.setCheckable(True)
@@ -103,6 +105,9 @@ class Sidebar(QFrame):
             self.nav_group.addButton(b)
             lay.addWidget(b)
             self.nav_buttons[key] = b
+        # 「管理」的显隐由 _update_admin_nav() 统一决定（本函数末尾会调一次）。
+        # 这里不要另外写一份隐藏逻辑 —— 两套机制会互相兜住，
+        # 导致"改坏了其中一个，测试还是绿的"。
 
         # ---- 标签筛选 ----
         self.lbl_tags = QLabel("标签筛选")
@@ -290,6 +295,8 @@ class MainWindow(QWidget):
         # 班级通告页：需要同步对象；没传时不崩（冒烟测试里就不传）
         self.class_view = ClassView(db, class_sync, theme, settings) \
             if class_sync is not None else None
+        # 老师端管理页：只有填了管理员密钥才会显示（见 _update_admin_nav）
+        self.admin_view = AdminView(settings, theme)
         self._page_order = ["list", "calendar", "stats"]
         self._page_titles = {"list": "列表", "calendar": "日历", "stats": "统计"}
         views = [self.list_view, self.calendar_view, self.stats_view]
@@ -298,9 +305,14 @@ class MainWindow(QWidget):
             self._page_titles["class"] = "班级"
             views.append(self.class_view)
             self.class_view.on_open_setup = self.open_settings
+        self._page_order.append("admin")
+        self._page_titles["admin"] = "班级管理"
+        views.append(self.admin_view)
         for v in views:
             self.stack.addWidget(v)
         content.addWidget(self.stack, 1)
+
+        self._update_admin_nav()
 
         # 列表页的「清除筛选」按钮要同步回侧边栏的标签选中状态
         self.list_view.on_filter_cleared = self._on_filter_cleared_from_list
@@ -330,6 +342,10 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------ 页面
     def switch_page(self, key: str):
+        # 「管理」页没配管理员密钥时不给进：侧边栏已经藏了，这里再挡一道，
+        # 防止 last_page 记着 "admin" 或者别处直接调进来。
+        if key == "admin" and not self._admin_ready():
+            key = "list"
         if key not in self._page_order:
             key = "list"
         idx = self._page_order.index(key)
@@ -384,10 +400,33 @@ class MainWindow(QWidget):
             self.stats_view.refresh()
         elif key == "class" and self.class_view is not None:
             self.class_view.refresh()
+        elif key == "admin":
+            self.admin_view.refresh()
         # 侧边栏「班级」项显示未读数
         self._update_class_badge()
         st = stats_mod.day_stats(self.db, date.today())
         self.lbl_sub.setText(f"今天 {st['done']}/{st['total']} 已完成")
+
+    # ------------------------------------------------------------------ 管理页
+    def _admin_ready(self) -> bool:
+        """填了服务器地址和管理员密钥，才算这台机器是"老师机"。"""
+        return bool((self.settings.get("class_admin_key", "") or "").strip()
+                    and (self.settings.get("class_server_url", "") or "").strip())
+
+    def _update_admin_nav(self):
+        """按有没有管理员密钥，显示/隐藏侧边栏的「管理」。"""
+        btn = self.sidebar.nav_buttons.get("admin")
+        if btn is None:
+            return
+        ready = self._admin_ready()
+        btn.setVisible(ready)
+        if not ready:
+            # 密钥被清掉了（比如老师把设置改回学生机）：如果人正停在管理页，
+            # 得把他挪回列表，否则停在一个再也进不去的页面上。
+            current = self._page_order[self.stack.currentIndex()] \
+                if 0 <= self.stack.currentIndex() < len(self._page_order) else "list"
+            if current == "admin":
+                self.switch_page("list")
 
     def _update_class_badge(self):
         """给侧边栏的「班级」加未读数，例如「📣   班级 (2)」。"""
@@ -813,6 +852,23 @@ class SettingsDialog(QDialog):
         row.addWidget(self.edit_class_name, 1)
         bl.addLayout(row)
 
+        # 管理员密钥：只有老师填。填了侧边栏才会出现「管理」，用来发通告/发任务。
+        # 这里要写清楚"同学别填"，否则学生拿到老师密钥填进来就成了老师身份。
+        row = QHBoxLayout()
+        row.addWidget(QLabel("管理员密钥（只有老师填）"))
+        self.edit_class_admin = QLineEdit(settings.get("class_admin_key", ""))
+        self.edit_class_admin.setEchoMode(QLineEdit.Password)
+        self.edit_class_admin.setPlaceholderText("同学留空！填了会多出「管理」页，能发内容")
+        row.addWidget(self.edit_class_admin, 1)
+        self.btn_admin_eye = QPushButton("显示")
+        self.btn_admin_eye.setObjectName("Ghost")
+        self.btn_admin_eye.setCursor(Qt.PointingHandCursor)
+        self.btn_admin_eye.setCheckable(True)
+        self.btn_admin_eye.setFixedWidth(56)
+        self.btn_admin_eye.toggled.connect(self._toggle_admin_key_echo)
+        row.addWidget(self.btn_admin_eye)
+        bl.addLayout(row)
+
         crow = QHBoxLayout()
         self.btn_class_test = QPushButton("测试连接")
         self.btn_class_test.setCursor(Qt.PointingHandCursor)
@@ -888,6 +944,12 @@ class SettingsDialog(QDialog):
         f.setFixedHeight(1)
         f.setStyleSheet(f"background: {c['divider']};")
         return f
+
+    def _toggle_admin_key_echo(self, shown: bool):
+        """管理员密钥默认打码，老师要核对时点一下「显示」。"""
+        self.edit_class_admin.setEchoMode(
+            QLineEdit.Normal if shown else QLineEdit.Password)
+        self.btn_admin_eye.setText("隐藏" if shown else "显示")
 
     def _try_sound(self):
         from ..reminder import play_chime
@@ -989,6 +1051,7 @@ class SettingsDialog(QDialog):
             class_server_url=self.edit_class_url.text().strip().rstrip("/"),
             class_join_key=self.edit_class_key.text().strip(),
             class_student_name=self.edit_class_name.text().strip(),
+            class_admin_key=self.edit_class_admin.text().strip(),
             class_enabled=bool(self.edit_class_url.text().strip()
                                and self.edit_class_key.text().strip()),
         )
@@ -1000,3 +1063,11 @@ class SettingsDialog(QDialog):
         self.theme.settings = self.settings
         self.theme.apply()
         self.accept()
+
+        # 保存后刷新主窗口：「管理」页可能要出现/消失，出现了就顺手拉一次数据，
+        # 别让老师进去看见一片空白还以为没发出去。
+        win = self.parent()
+        if win is not None and hasattr(win, "_update_admin_nav"):
+            win._update_admin_nav()
+            if win._admin_ready():
+                win.admin_view.refresh()

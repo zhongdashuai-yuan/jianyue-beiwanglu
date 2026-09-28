@@ -156,6 +156,73 @@ def main() -> int:
     check("名单里有设备数统计", (d.get("stats") or {}).get("members") == 2,
           str(d.get("stats")))
 
+    # ---- 5.5 只读列表 + 管理员全量列表 ----
+    # 这几个接口是老师端「管理」页用的：管理页要能看见"已经撤回"的条目
+    # （灰掉显示），所以 /api/admin/list 必须带 include_withdrawn。
+    say("")
+    say("=== 5.5 只读列表 / 管理列表 ===")
+    aid = srv.Handler.api.store.add_announcement("列表测试", "正文")
+    code, d = req(base, "/api/announcements", key=join_key)
+    titles = [a.get("title") for a in (d.get("announcements") or [])]
+    check("接入密钥能读通告列表", code == 200 and "列表测试" in titles, str(titles))
+    check("只读列表带统计", isinstance(d.get("stats"), dict), str(d.get("stats")))
+
+    # 撤回一条，接入密钥就不该再看到它，管理员还能看到（管理页要显示"已撤回"）
+    srv.Handler.api.store.add_announcement("撤回了的", "看不见了")
+    srv.Handler.api.store.withdraw_announcement(aid)
+    code, d = req(base, "/api/announcements", key=join_key)
+    titles = [a.get("title") for a in (d.get("announcements") or [])]
+    check("接入密钥看不到已撤回的", "列表测试" not in titles, str(titles))
+    code, d = req(base, "/api/announcements", key=admin_key)
+    titles = [a.get("title") for a in (d.get("announcements") or [])]
+    check("管理员能看到已撤回的", "列表测试" in titles, str(titles))
+
+    code, d = req(base, "/api/tasks", key=join_key)
+    check("接入密钥能读任务列表", code == 200 and isinstance(d.get("tasks"), list))
+
+    code, d = req(base, "/api/admin/list", key=admin_key)
+    check("管理列表一次带回四样东西",
+          code == 200 and all(k in d for k in
+                              ("announcements", "tasks", "members", "stats")),
+          str(sorted(d.keys())))
+    code, d = req(base, "/api/admin/list", key=join_key)
+    check("接入密钥读不了管理列表（403）", code == 403, f"HTTP {code}")
+    code, d = req(base, "/api/admin/list")
+    check("没有密钥读不了管理列表（403）", code == 403, f"HTTP {code}")
+
+    # ---- 5.6 管理员写入接口 ----
+    say("")
+    say("=== 5.6 管理员发的接口（管理页走的就是这些）===")
+    code, d = req(base, "/api/announcement",
+                  key=admin_key, body={"title": "界面发的通告", "body": "正文"})
+    check("管理员能发通告", code == 200 and d.get("ok") and d.get("id"),
+          f"HTTP {code} {d}")
+    new_aid = d.get("id")
+
+    code, d = req(base, "/api/announcement",
+                  key=join_key, body={"title": "学生想发", "body": "x"})
+    check("接入密钥发不了通告（403）", code == 403, f"HTTP {code}")
+
+    code, d = req(base, "/api/announcement", key=admin_key, body={"title": "  "})
+    check("空标题被拒（400）", code == 400, f"HTTP {code} {d.get('error')}")
+
+    code, d = req(base, "/api/task", key=admin_key,
+                  body={"title": "界面发的任务", "times": ["19:00"],
+                        "recur": "weekly", "recur_params": {"weekdays": [5]}})
+    check("管理员能发任务", code == 200 and d.get("ok"), f"HTTP {code} {d}")
+    new_tid = d.get("id")
+
+    code, d = req(base, "/api/task", key=join_key, body={"title": "学生想发任务"})
+    check("接入密钥发不了任务（403）", code == 403, f"HTTP {code}")
+
+    code, d = req(base, "/api/announcement/withdraw", key=admin_key,
+                  body={"id": new_aid})
+    check("管理员能撤回通告", code == 200 and d.get("ok"), f"HTTP {code} {d}")
+    code, d = req(base, "/api/task/withdraw", key=join_key, body={"id": new_tid})
+    check("接入密钥撤不了任务（403）", code == 403, f"HTTP {code}")
+    code, d = req(base, "/api/task/withdraw", key=admin_key, body={"id": new_tid})
+    check("管理员能撤回任务", code == 200 and d.get("ok"), f"HTTP {code} {d}")
+
     # ---- 6. 限流 ----
     say("")
     say("=== 6. 频率限制 ===")

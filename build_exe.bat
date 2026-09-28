@@ -74,11 +74,18 @@ if "%MODENAME%"=="onefile" (
 )
 echo  数据位置: E:\Memo\data\   （重新打包不会丢数据）
 echo.
-echo  部署到正式目录时，两种模式都要更新一次：
-echo    copy dist\备忘录提醒\*  E:\Memo\备忘录提醒\
-echo    copy dist_onefile\*.exe E:\Memo\备忘录提醒\
+echo  部署到正式目录时，两种模式都要更新一次。
 echo.
-echo  只更新其中一个，就可能出现「新代码配旧依赖」的白窗口问题。
+echo  ⚠️ 用 robocopy /MIR，别用 copy —— copy 遇到已存在的
+echo     _internal 目录会整个跳过，结果 exe 是新的、依赖还是旧的，
+echo     双击就白窗口。这个坑我踩过一次（文件数一样，内容不一样）。
+echo.
+echo    robocopy "dist\备忘录提醒" "E:\Memo\备忘录提醒" /MIR /NFL /NDL /NJH /NJS
+echo    copy /Y "dist_onefile\备忘录提醒单文件.exe" "E:\Memo\备忘录提醒\备忘录提醒-单文件版.exe"
+echo.
+echo  检查部署是否成功：源和目标的 _internal 修改时间应当一致
+echo    dir "dist\备忘录提醒\_internal" ^| find "."
+echo    dir "E:\Memo\备忘录提醒\_internal" ^| find "."
 echo ============================================================
 echo.
 pause

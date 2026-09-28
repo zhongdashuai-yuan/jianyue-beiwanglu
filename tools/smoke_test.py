@@ -234,7 +234,7 @@ def main() -> int:
         db, date.today() - timedelta(days=7), date.today()), list))
 
     say("\n=== 5. 界面构造（offscreen）===")
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QWidget
     app = QApplication.instance() or QApplication(sys.argv)
     from app.theme import ThemeManager, build_qss, make_icon
     settings = cfg.Settings(tmp / "ui.json")
@@ -256,6 +256,41 @@ def main() -> int:
     check("主窗口构造", win is not None)
     win.show()
     app.processEvents()
+
+    # 「管理」页是老师专用的：没填管理员密钥就不能出现，也不能进去。
+    # 这条要是坏了，学生那边会白多一个能发通告的页面。
+    admin_btn = win.sidebar.nav_buttons.get("admin")
+    check("有「管理」导航按钮", admin_btn is not None)
+    chk_hidden = QWidget.isVisibleTo
+    check("没填管理员密钥时「管理」是藏起来的",
+          not chk_hidden(admin_btn, win.sidebar))
+    win.switch_page("admin")
+    _cur = win._page_order[win.stack.currentIndex()]
+    check("没密钥时进不去管理页（被弹回列表）", _cur == "list",
+          f"{_cur}  admin_ready={win._admin_ready()}  "
+          f"key={settings.get('class_admin_key')!r}  "
+          f"url={settings.get('class_server_url')!r}")
+
+    # 填上管理员密钥后，管理页应该出现并且能进去
+    settings.update(class_server_url="http://127.0.0.1:9", class_admin_key="ADMIN-X")
+    win._update_admin_nav()
+    app.processEvents()
+    check("填了管理员密钥后「管理」出现",
+          chk_hidden(win.sidebar.nav_buttons["admin"], win.sidebar))
+    win.switch_page("admin")
+    check("填了密钥后能进管理页",
+          win._page_order[win.stack.currentIndex()] == "admin")
+
+    # 把密钥清掉：得自动退回列表，不能停在一个再也进不去的页面上
+    settings.update(class_admin_key="")
+    win._update_admin_nav()
+    app.processEvents()
+    check("清掉密钥后「管理」又藏起来",
+          not chk_hidden(win.sidebar.nav_buttons["admin"], win.sidebar))
+    check("清掉密钥后自动从管理页退回列表",
+          win._page_order[win.stack.currentIndex()] == "list",
+          win._page_order[win.stack.currentIndex()])
+    win.switch_page("list")
 
     # 三个视图 + 页面切换全部用 step() 包住，任何异常都会算失败并打印堆栈
     step("列表视图刷新", lambda: (win.list_view.refresh(), app.processEvents()))

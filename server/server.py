@@ -272,6 +272,40 @@ class Api:
                                     if r["withdrawn"]],
             }
 
+        # 只读列表：管理员密钥能看到已撤回的，接入密钥只能看到还在的。
+        # 单列这个接口是为了让"查一下服务端上有什么"这种需求不用走 /api/sync
+        # （sync 会顺带登记设备，只查内容不该留下访问记录）。
+        if path == "/api/announcements":
+            ok, err = self.check(headers, need_admin=False)
+            if not ok:
+                return 401, {"ok": False, "error": err}
+            is_admin = headers.get("x-memo-key", "") == self.admin_key
+            items = self.store.announcements(0, include_withdrawn=is_admin)
+            if not is_admin:
+                items = [a for a in items if not a.get("withdrawn")]
+            return 200, {"ok": True, "announcements": items,
+                         "stats": self.store.stats()}
+
+        if path == "/api/tasks":
+            ok, err = self.check(headers, need_admin=False)
+            if not ok:
+                return 401, {"ok": False, "error": err}
+            is_admin = headers.get("x-memo-key", "") == self.admin_key
+            return 200, {"ok": True,
+                         "tasks": self.store.tasks(0, include_withdrawn=is_admin)}
+
+        # 管理页用：一次把通告、任务、名单、统计都拿回来。
+        # 管理页要做"撤回"，所以这里必须能看见已经撤回的条目（灰掉显示）。
+        if path == "/api/admin/list":
+            ok, err = self.check(headers, need_admin=True)
+            if not ok:
+                return 403, {"ok": False, "error": err}
+            return 200, {"ok": True,
+                         "announcements": self.store.announcements(0, True),
+                         "tasks": self.store.tasks(0, True),
+                         "members": self.store.members(),
+                         "stats": self.store.stats()}
+
         # 以下都需要管理员密钥
         if path == "/api/announcement" and method == "POST":
             ok, err = self.check(headers, need_admin=True)
